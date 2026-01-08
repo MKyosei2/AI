@@ -15,9 +15,9 @@ public class HighOrbitAI_BootstrapOneShot : MonoBehaviour { }
 public class AutoMovingTarget : MonoBehaviour
 {
     public Vector3 center = Vector3.zero;
-    public float radius = 55f;
+    public float radius = 650f;          // 広大ワールド用に拡大
     public float height = 1.2f;
-    public float angularSpeedDeg = 35f;
+    public float angularSpeedDeg = 18f;  // ゆっくりにして見やすく
     public bool figureEight = true;
 
     float t;
@@ -42,34 +42,30 @@ public class AutoMovingTarget : MonoBehaviour
 }
 
 /// <summary>
-/// “AIが画面外に行かない” を最優先した追従カメラ
-/// - AIの速度方向の後ろに回り込む（先読み）
-/// - 速度が上がるほど距離を取る
-/// - Viewportチェックで外れそうなら即補正
+/// “AIが画面外に行かない”優先の追従カメラ（広大ワールド向け調整）
 /// </summary>
 public class SmartAICameraFollow : MonoBehaviour
 {
     public Transform target;
 
     [Header("Distance")]
-    public float minDistance = 35f;
-    public float maxDistance = 90f;
-    public float speedToMaxDistance = 25f;
+    public float minDistance = 80f;
+    public float maxDistance = 220f;
+    public float speedToMaxDistance = 35f;
 
     [Header("Height")]
-    public float minHeight = 18f;
-    public float maxHeight = 60f;
+    public float minHeight = 45f;
+    public float maxHeight = 140f;
 
     [Header("Look Ahead")]
-    public float lookAheadTime = 0.35f;
+    public float lookAheadTime = 0.5f;
 
     [Header("Smoothing")]
-    public float positionSharpness = 12f; // 大きいほど追従が速い（画面外防止）
-    public float rotationSharpness = 14f;
+    public float positionSharpness = 16f;
+    public float rotationSharpness = 18f;
 
     [Header("Viewport Safety")]
-    [Tooltip("AIがこの範囲内に入るように補正する（0.0〜0.5）。0.12くらいがおすすめ")]
-    public float safeMargin = 0.12f;
+    public float safeMargin = 0.16f;
 
     Camera cam;
     Vector3 lastTargetPos;
@@ -94,35 +90,27 @@ public class SmartAICameraFollow : MonoBehaviour
             inited = true;
         }
 
-        // 速度推定
         Vector3 v = (target.position - lastTargetPos) / Mathf.Max(dt, 1e-6f);
         targetVel = Vector3.Lerp(targetVel, v, 0.35f);
         lastTargetPos = target.position;
 
-        // 先読み位置
         Vector3 aim = target.position + targetVel * lookAheadTime;
 
-        // “後ろ方向”を速度ベクトルから決める（止まってる時はカメラの前方向を使う）
         Vector3 forward = targetVel.sqrMagnitude > 0.1f ? targetVel.normalized : target.forward;
         Vector3 back = -forward;
 
-        // 速度に応じて距離を可変
         float speed = targetVel.magnitude;
         float t01 = Mathf.Clamp01(speed / Mathf.Max(1f, speedToMaxDistance));
         float dist = Mathf.Lerp(minDistance, maxDistance, t01);
         float height = Mathf.Lerp(minHeight, maxHeight, t01);
 
-        // 希望位置（速度後方 + 高さ）
         Vector3 desiredPos = aim + back * dist + Vector3.up * height;
 
-        // まず通常追従（シャープに）
         transform.position = ExpLerp(transform.position, desiredPos, positionSharpness, dt);
 
-        // 常にターゲットを見る
         Quaternion desiredRot = Quaternion.LookRotation((aim - transform.position).normalized, Vector3.up);
         transform.rotation = ExpSlerp(transform.rotation, desiredRot, rotationSharpness, dt);
 
-        // 画面外防止：Viewportで安全領域に収まっているかチェックして補正
         KeepTargetInView(aim, back, dist, height, dt);
     }
 
@@ -130,7 +118,6 @@ public class SmartAICameraFollow : MonoBehaviour
     {
         Vector3 vp = cam.WorldToViewportPoint(aim);
 
-        // vp.z <= 0 はカメラ背面
         bool outOfView =
             vp.z <= 0f ||
             vp.x < safeMargin || vp.x > (1f - safeMargin) ||
@@ -138,28 +125,22 @@ public class SmartAICameraFollow : MonoBehaviour
 
         if (!outOfView) return;
 
-        // 外れそうなら「距離を増やす」「高さを増やす」「回り込みを強める」を即適用
-        float extra = 1.35f;     // 距離ブースト
-        float extraH = 1.15f;    // 高さブースト
+        float extra = 1.5f;
+        float extraH = 1.2f;
 
         Vector3 hardPos = aim + back * (dist * extra) + Vector3.up * (height * extraH);
 
-        // すぐ戻す（補正は強め）
-        transform.position = Vector3.Lerp(transform.position, hardPos, 1f - Mathf.Exp(-30f * dt));
+        transform.position = Vector3.Lerp(transform.position, hardPos, 1f - Mathf.Exp(-35f * dt));
 
         Quaternion hardRot = Quaternion.LookRotation((aim - transform.position).normalized, Vector3.up);
-        transform.rotation = Quaternion.Slerp(transform.rotation, hardRot, 1f - Mathf.Exp(-30f * dt));
+        transform.rotation = Quaternion.Slerp(transform.rotation, hardRot, 1f - Mathf.Exp(-35f * dt));
     }
 
     static Vector3 ExpLerp(Vector3 current, Vector3 target, float sharpness, float dt)
-    {
-        return Vector3.Lerp(current, target, 1f - Mathf.Exp(-sharpness * dt));
-    }
+        => Vector3.Lerp(current, target, 1f - Mathf.Exp(-sharpness * dt));
 
     static Quaternion ExpSlerp(Quaternion current, Quaternion target, float sharpness, float dt)
-    {
-        return Quaternion.Slerp(current, target, 1f - Mathf.Exp(-sharpness * dt));
-    }
+        => Quaternion.Slerp(current, target, 1f - Mathf.Exp(-sharpness * dt));
 }
 
 public class ZoneGizmo : MonoBehaviour
@@ -189,7 +170,7 @@ public static class HighOrbitAI_BootstrapMenu
     const string L_TARGET = "Target";
     const string L_ENEMY  = "Enemy";
 
-    [MenuItem("Tools/HighOrbitAI/Bootstrap Empty Scene (AI Only, Colored, Camera Lock)")]
+    [MenuItem("Tools/HighOrbitAI/Bootstrap Huge World (AI Only)")]
     public static void Bootstrap()
     {
         EnsureLayer(L_STATIC);
@@ -198,52 +179,123 @@ public static class HighOrbitAI_BootstrapMenu
         EnsureLayer(L_ENEMY);
 
         DeleteIfExists("NavWorld");
-        DeleteIfExists("Ground");
+        DeleteIfExists("WorldRoot");
         DeleteIfExists("Target");
         DeleteIfExists("Enemy_HighOrbitAI");
-        DeleteIfExists("KeepOut_Zone");
-        DeleteIfExists("SoftAvoid_Zone");
-        DeleteIfExists("StaticObstacles");
+        DeleteIfExists("Main Camera"); // 作り直してOKにする
+        DeleteIfExists("Directional Light");
 
+        // 色
         Color cGround   = new Color(0.55f, 0.75f, 0.55f);
+        Color cRoad     = new Color(0.20f, 0.22f, 0.24f);
+        Color cGrid     = new Color(0.85f, 0.85f, 0.85f);
         Color cBuilding = new Color(0.18f, 0.18f, 0.20f);
         Color cKeepOut  = new Color(1.00f, 0.20f, 0.20f);
         Color cSoft     = new Color(1.00f, 0.92f, 0.25f);
         Color cTarget   = new Color(0.10f, 0.85f, 1.00f);
         Color cEnemy    = new Color(1.00f, 0.20f, 1.00f);
+        Color cLandmark = new Color(0.55f, 0.25f, 1.00f);
 
-        // Ground
-        var ground = GameObject.CreatePrimitive(PrimitiveType.Plane);
-        ground.name = "Ground";
-        ground.transform.position = Vector3.zero;
-        ground.transform.localScale = new Vector3(20, 1, 20);
-        ground.layer = 0;
-        ApplyColor(ground, cGround, 1f, emissive: false);
+        var root = new GameObject("WorldRoot");
 
-        // NavWorld
+        // ---- ライト（視認性UP）
+        var lightGo = new GameObject("Directional Light");
+        var dl = lightGo.AddComponent<Light>();
+        dl.type = LightType.Directional;
+        dl.intensity = 1.2f;
+        lightGo.transform.rotation = Quaternion.Euler(50f, -30f, 0f);
+
+        // ---- 巨大地面（タイル敷きで“広い”を演出）
+        // 1タイル=200m四方程度。9x9 で約1.8km四方。
+        int tiles = 9;
+        float tileScale = 20f;        // Plane(10x10) * 20 = 200m
+        float tileSize = 10f * tileScale;
+        float half = (tiles * tileSize) * 0.5f;
+
+        var groundRoot = new GameObject("GroundTiles");
+        groundRoot.transform.SetParent(root.transform);
+
+        for (int x = 0; x < tiles; x++)
+        for (int z = 0; z < tiles; z++)
+        {
+            var g = GameObject.CreatePrimitive(PrimitiveType.Plane);
+            g.transform.SetParent(groundRoot.transform);
+            g.transform.localScale = new Vector3(tileScale, 1f, tileScale);
+            g.transform.position = new Vector3(
+                (x * tileSize) - half + tileSize * 0.5f,
+                0f,
+                (z * tileSize) - half + tileSize * 0.5f
+            );
+            g.layer = 0; // Default（Blockedにしない）
+            ApplyColor(g, cGround, 1f, emissive: false);
+        }
+
+        // ---- グリッド線（世界のスケールが直感で分かる）
+        // 線は細いキューブで描画（軽い）
+        var gridRoot = new GameObject("GridLines");
+        gridRoot.transform.SetParent(root.transform);
+
+        int gridCount = 21;      // 0〜±1000m を 100m刻みで
+        float gridSpan = 2000f;  // 線の長さ
+        float gridStep = 100f;
+
+        for (int i = -gridCount/2; i <= gridCount/2; i++)
+        {
+            float p = i * gridStep;
+
+            // X方向線（Z固定）
+            CreateLine(gridRoot.transform,
+                new Vector3(-gridSpan * 0.5f, 0.02f, p),
+                new Vector3( gridSpan * 0.5f, 0.02f, p),
+                (i % 5 == 0) ? 1.0f : 0.35f, // 500m毎に太く
+                cGrid
+            );
+
+            // Z方向線（X固定）
+            CreateLine(gridRoot.transform,
+                new Vector3(p, 0.02f, -gridSpan * 0.5f),
+                new Vector3(p, 0.02f,  gridSpan * 0.5f),
+                (i % 5 == 0) ? 1.0f : 0.35f,
+                cGrid
+            );
+        }
+
+        // ---- ランドマーク塔（遠距離でも位置が分かる）
+        var landmarkRoot = new GameObject("Landmarks");
+        landmarkRoot.transform.SetParent(root.transform);
+        CreateLandmark(landmarkRoot.transform, new Vector3( 800, 60,  800), cLandmark);
+        CreateLandmark(landmarkRoot.transform, new Vector3(-800, 60,  800), cLandmark);
+        CreateLandmark(landmarkRoot.transform, new Vector3( 800, 60, -800), cLandmark);
+        CreateLandmark(landmarkRoot.transform, new Vector3(-800, 60, -800), cLandmark);
+
+        // ---- NavWorld（VolumeCollector）
         var navWorld = new GameObject("NavWorld");
+        navWorld.transform.SetParent(root.transform);
         var collector = navWorld.AddComponent<VolumeCollector>();
         collector.agentRadius = 0.5f;
-        collector.dynamicCellSize = 10f;
+        collector.dynamicCellSize = 12f;
         collector.staticMask = LayerMask.GetMask(L_STATIC);
         collector.dynamicMask = LayerMask.GetMask(L_DYNAMIC);
 
-        // Buildings
+        // ---- 目立つ建物（障害物）を数個（広大でも目印になる）
         var obstaclesRoot = new GameObject("StaticObstacles");
-        CreateBuilding(obstaclesRoot.transform, new Vector3( 20,  8,  10), new Vector3(12, 16, 12), cBuilding);
-        CreateBuilding(obstaclesRoot.transform, new Vector3(-25,  6, -15), new Vector3(14, 12, 10), cBuilding);
-        CreateBuilding(obstaclesRoot.transform, new Vector3(  0, 10,  30), new Vector3(18, 20, 14), cBuilding);
-        CreateBuilding(obstaclesRoot.transform, new Vector3( 35,  5, -30), new Vector3(10, 10, 18), cBuilding);
+        obstaclesRoot.transform.SetParent(root.transform);
 
-        // KeepOut
+        CreateBuilding(obstaclesRoot.transform, new Vector3( 250, 18,  120), new Vector3(40, 36, 40), cBuilding);
+        CreateBuilding(obstaclesRoot.transform, new Vector3(-320, 14, -260), new Vector3(50, 28, 35), cBuilding);
+        CreateBuilding(obstaclesRoot.transform, new Vector3(  60, 22,  420), new Vector3(60, 44, 45), cBuilding);
+        CreateBuilding(obstaclesRoot.transform, new Vector3( 520, 16, -420), new Vector3(45, 32, 55), cBuilding);
+
+        // ---- ゾーン（禁止/回避）も大きくして見やすく
         var keep = new GameObject("KeepOut_Zone");
-        keep.transform.position = new Vector3(0, 2, 0);
+        keep.transform.SetParent(root.transform);
+        keep.transform.position = new Vector3(0, 6, 0);
         var keepCol = keep.AddComponent<BoxCollider>();
-        keepCol.size = new Vector3(14, 8, 14);
+        keepCol.size = new Vector3(120, 30, 120);
         keepCol.isTrigger = true;
 
         var keepOut = keep.AddComponent<KeepOutZone>();
-        keepOut.margin = 12f;
+        keepOut.margin = 40f;
         keepOut.isDynamic = false;
 
         var keepVis = GameObject.CreatePrimitive(PrimitiveType.Cube);
@@ -252,22 +304,22 @@ public static class HighOrbitAI_BootstrapMenu
         keepVis.transform.localPosition = keepCol.center;
         keepVis.transform.localScale = keepCol.size;
         Object.DestroyImmediate(keepVis.GetComponent<Collider>());
-        ApplyColor(keepVis, cKeepOut, 0.18f, emissive: true);
+        ApplyColor(keepVis, cKeepOut, 0.14f, emissive: true);
 
         var keepG = keep.AddComponent<ZoneGizmo>();
         keepG.wireColor = new Color(cKeepOut.r, cKeepOut.g, cKeepOut.b, 1f);
-        keepG.fillColor = new Color(cKeepOut.r, cKeepOut.g, cKeepOut.b, 0.08f);
+        keepG.fillColor = new Color(cKeepOut.r, cKeepOut.g, cKeepOut.b, 0.06f);
 
-        // SoftAvoid
         var soft = new GameObject("SoftAvoid_Zone");
-        soft.transform.position = new Vector3(-10, 2, 25);
+        soft.transform.SetParent(root.transform);
+        soft.transform.position = new Vector3(-250, 6, 450);
         var softCol = soft.AddComponent<BoxCollider>();
-        softCol.size = new Vector3(20, 8, 20);
+        softCol.size = new Vector3(160, 30, 160);
         softCol.isTrigger = true;
 
         var softAvoid = soft.AddComponent<SoftAvoidZone>();
-        softAvoid.margin = 10f;
-        softAvoid.costAdd = 25f;
+        softAvoid.margin = 35f;
+        softAvoid.costAdd = 35f;
         softAvoid.isDynamic = false;
 
         var softVis = GameObject.CreatePrimitive(PrimitiveType.Cube);
@@ -276,75 +328,104 @@ public static class HighOrbitAI_BootstrapMenu
         softVis.transform.localPosition = softCol.center;
         softVis.transform.localScale = softCol.size;
         Object.DestroyImmediate(softVis.GetComponent<Collider>());
-        ApplyColor(softVis, cSoft, 0.15f, emissive: true);
+        ApplyColor(softVis, cSoft, 0.12f, emissive: true);
 
         var softG = soft.AddComponent<ZoneGizmo>();
         softG.wireColor = new Color(cSoft.r, cSoft.g, cSoft.b, 1f);
-        softG.fillColor = new Color(cSoft.r, cSoft.g, cSoft.b, 0.07f);
+        softG.fillColor = new Color(cSoft.r, cSoft.g, cSoft.b, 0.05f);
 
-        // Target
+        // ---- Target（広い範囲で動く）
         var target = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
         target.name = "Target";
         target.layer = LayerMask.NameToLayer(L_TARGET);
-        target.transform.position = new Vector3(-40, 1.2f, -40);
-        target.transform.localScale = new Vector3(1.2f, 0.6f, 1.2f);
+        target.transform.position = new Vector3(-650, 1.2f, -650);
+        target.transform.localScale = new Vector3(3f, 1.2f, 3f);
         ApplyColor(target, cTarget, 1f, emissive: true);
 
         var mover = target.AddComponent<AutoMovingTarget>();
         mover.center = Vector3.zero;
-        mover.radius = 55f;
+        mover.radius = 650f;
         mover.height = 1.2f;
-        mover.angularSpeedDeg = 35f;
+        mover.angularSpeedDeg = 18f;
         mover.figureEight = true;
 
-        // Enemy
+        // ---- Enemy（AI）
         var enemy = GameObject.CreatePrimitive(PrimitiveType.Sphere);
         enemy.name = "Enemy_HighOrbitAI";
         enemy.layer = LayerMask.NameToLayer(L_ENEMY);
-        enemy.transform.position = new Vector3(40, 200f, 40);
+        enemy.transform.position = new Vector3(650, 380f, 650); // 高軌道をより高く
         var enemyCol = enemy.GetComponent<SphereCollider>();
         if (enemyCol != null) enemyCol.isTrigger = true;
+        enemy.transform.localScale = Vector3.one * 6f; // 見やすく大きく
         ApplyColor(enemy, cEnemy, 1f, emissive: true);
 
         var flight = enemy.AddComponent<FlightController>();
-        flight.maxSpeed = 22f;
-        flight.maxAccel = 40f;
-        flight.maxYawDegPerSec = 240f;
-        flight.maxClimbRate = 20f;
+        flight.maxSpeed = 35f;
+        flight.maxAccel = 55f;
+        flight.maxYawDegPerSec = 220f;
+        flight.maxClimbRate = 28f;
 
         var ai = enemy.AddComponent<global::HighOrbitAI.HighOrbitAI>();
         ai.player = target.transform;
         ai.volumeCollector = collector;
         ai.controller = flight;
 
-        ai.Hcruise = 200f;
-        ai.cruiseBand = 20f;
+        ai.Hcruise = 380f;
+        ai.cruiseBand = 30f;
         ai.decisionHz = 15f;
-        ai.descendRange = 85f;
-        ai.ascendRange  = 150f;
-        ai.localRadius = 70f;
-        ai.localCellSize = 5f;
-        ai.agentRadius = 0.5f;
 
-        // Camera: “AIを画面内に固定” 追従
-        Camera cam = Camera.main;
-        if (cam == null)
-        {
-            var camGo = new GameObject("Main Camera");
-            cam = camGo.AddComponent<Camera>();
-            camGo.tag = "MainCamera";
-        }
-        cam.fieldOfView = 65f;
+        ai.descendRange = 140f;
+        ai.ascendRange  = 260f;
 
-        var camFollow = cam.GetComponent<SmartAICameraFollow>();
-        if (camFollow == null) camFollow = cam.gameObject.AddComponent<SmartAICameraFollow>();
+        ai.localRadius = 120f;
+        ai.localCellSize = 8f;
+        ai.agentRadius = 0.8f;
+
+        // ---- Camera
+        var camGo2 = new GameObject("Main Camera");
+        var cam = camGo2.AddComponent<Camera>();
+        camGo2.tag = "MainCamera";
+        cam.fieldOfView = 62f;
+        cam.farClipPlane = 8000f;
+
+        var camFollow = camGo2.AddComponent<SmartAICameraFollow>();
         camFollow.target = enemy.transform;
 
         // Build volumes
         collector.Build();
 
         SceneView.lastActiveSceneView?.FrameSelected();
-        Debug.Log("Bootstrap completed: Camera locks AI in view.");
+        Debug.Log("Bootstrap completed: Huge world + grid + landmarks created.");
+    }
+
+    static void CreateLine(Transform parent, Vector3 a, Vector3 b, float thickness, Color color)
+    {
+        var go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        go.name = "GridLine";
+        go.transform.SetParent(parent);
+        Object.DestroyImmediate(go.GetComponent<Collider>());
+
+        Vector3 mid = (a + b) * 0.5f;
+        Vector3 dir = (b - a);
+        float len = dir.magnitude;
+        if (len < 0.001f) len = 0.001f;
+
+        go.transform.position = mid;
+        go.transform.rotation = Quaternion.LookRotation(dir.normalized, Vector3.up);
+        go.transform.localScale = new Vector3(thickness, 0.05f, len);
+
+        ApplyColor(go, color, 0.55f, emissive: false);
+    }
+
+    static void CreateLandmark(Transform parent, Vector3 pos, Color color)
+    {
+        var tower = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        tower.name = "LandmarkTower";
+        tower.transform.SetParent(parent);
+        tower.transform.position = new Vector3(pos.x, pos.y * 0.5f, pos.z);
+        tower.transform.localScale = new Vector3(12f, pos.y * 0.5f, 12f);
+        Object.DestroyImmediate(tower.GetComponent<Collider>()); // 目印なので衝突不要
+        ApplyColor(tower, color, 1f, emissive: true);
     }
 
     static void CreateBuilding(Transform parent, Vector3 pos, Vector3 size, Color color)
@@ -412,9 +493,7 @@ public static class HighOrbitAI_BootstrapMenu
                 mat.EnableKeyword("_EMISSION");
             }
             if (mat.HasProperty("_EmissiveColor"))
-            {
                 mat.SetColor("_EmissiveColor", e);
-            }
         }
 
         if (alpha < 0.999f)
