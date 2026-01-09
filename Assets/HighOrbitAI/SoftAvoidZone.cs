@@ -2,18 +2,10 @@ using UnityEngine;
 
 namespace HighOrbitAI
 {
-    /// <summary>
-    /// できれば避けたい領域（通っても良いがコスト増）。
-    /// </summary>
     public class SoftAvoidZone : MonoBehaviour
     {
-        [Tooltip("避けたい周辺範囲（m）")]
         public float margin = 10f;
-
-        [Tooltip("この領域に入ったときの追加コスト")]
         public float costAdd = 20f;
-
-        [Tooltip("このゾーンが動くならtrue")]
         public bool isDynamic = false;
 
         public Bounds GetInflatedBounds(float agentRadius = 0f)

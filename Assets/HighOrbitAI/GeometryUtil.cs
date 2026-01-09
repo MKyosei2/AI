@@ -4,19 +4,12 @@ namespace HighOrbitAI
 {
     public static class GeometryUtil
     {
-        /// <summary>Boundsを一様に膨らませる（KeepOutの周辺範囲など）</summary>
         public static Bounds Inflate(Bounds b, float margin)
         {
             b.Expand(new Vector3(margin * 2f, margin * 2f, margin * 2f));
             return b;
         }
 
-        /// <summary>点がAABB内か（UnityのBounds.Containsは境界含む）</summary>
-        public static bool Contains(Bounds b, Vector3 p) => b.Contains(p);
-
-        /// <summary>
-        /// 線分 vs AABB（スラブ法）: ざっくり衝突判定用（Cruiseエッジ検証など）
-        /// </summary>
         public static bool SegmentIntersectsAabb(Vector3 p0, Vector3 p1, Bounds b)
         {
             Vector3 dir = p1 - p0;
@@ -44,16 +37,11 @@ namespace HighOrbitAI
             tmin = Mathf.Max(tmin, Mathf.Min(t1, t2));
             tmax = Mathf.Min(tmax, Mathf.Max(t1, t2));
 
-            // tが[0,1]区間に交差していれば線分と交差
             return tmax >= Mathf.Max(0f, tmin) && tmin <= 1f;
         }
 
-        /// <summary>
-        /// AABBから点までの最短ベクトル（点が外にある場合、境界への押し戻し方向に使う）
-        /// </summary>
         public static Vector3 ClosestVectorToOutside(Bounds b, Vector3 p)
         {
-            // bの外に出すための最小押し戻し（単純版）
             Vector3 min = b.min;
             Vector3 max = b.max;
 
@@ -64,7 +52,6 @@ namespace HighOrbitAI
             float dzMin = p.z - min.z;
             float dzMax = max.z - p.z;
 
-            // 内部にいる前提で、最も近い面方向へ押し出す
             float m = dxMin; Vector3 v = new Vector3(-1,0,0);
             if (dxMax < m) { m = dxMax; v = new Vector3( 1,0,0); }
             if (dyMin < m) { m = dyMin; v = new Vector3(0,-1,0); }

@@ -3,10 +3,6 @@ using UnityEngine;
 
 namespace HighOrbitAI
 {
-    /// <summary>
-    /// 動的オブジェクト用の軽量インデックス（セルハッシュ）。
-    /// 近傍（セル周辺）だけを引けるので、総数が増えても破綻しにくい。
-    /// </summary>
     public class SpatialHash3D
     {
         readonly float cellSize;
@@ -30,15 +26,12 @@ namespace HighOrbitAI
 
         long Key(Vector3Int c)
         {
-            // 3Dの整数座標を64bitへ（符号付き対応）
             unchecked
             {
                 long x = (long)c.x;
                 long y = (long)c.y;
                 long z = (long)c.z;
-                // 簡易ミックス
-                long h = x * 73856093L ^ y * 19349663L ^ z * 83492791L;
-                return h;
+                return x * 73856093L ^ y * 19349663L ^ z * 83492791L;
             }
         }
 

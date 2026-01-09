@@ -3,28 +3,16 @@ using UnityEngine;
 
 namespace HighOrbitAI
 {
-    /// <summary>
-    /// シーンからCollider/Zoneコンポーネントを集め、VolumeDatabaseを構築する。
-    /// - 静的: StaticBVHへ
-    /// - 動的: SpatialHashへ
-    /// </summary>
     public class VolumeCollector : MonoBehaviour
     {
-        [Header("Layer masks (推奨)")]
         public LayerMask staticMask;
         public LayerMask dynamicMask;
 
-        [Header("Common")]
-        [Tooltip("AIの半径（KeepOut膨張などに使う）")]
-        public float agentRadius = 0.5f;
-
-        [Tooltip("Dynamic Hash のセルサイズ（大きいほど軽いが粗い）")]
+        public float agentRadius = 0.8f;
         public float dynamicCellSize = 10f;
 
-        [Header("Generated")]
         public VolumeDatabase database;
 
-        // 動的登録の追跡（Bounds更新用）
         readonly List<DynamicEntry> dynamicEntries = new List<DynamicEntry>(256);
 
         struct DynamicEntry
@@ -33,27 +21,25 @@ namespace HighOrbitAI
             public Collider collider;
             public KeepOutZone keepOut;
             public SoftAvoidZone softAvoid;
+            public ConditionalVolume conditional;
         }
 
         void Awake()
         {
+            database = new VolumeDatabase();
+            database.Initialize(dynamicCellSize);
             Build();
         }
 
         public void Build()
         {
-            database = new VolumeDatabase();
-            database.Initialize(dynamicCellSize);
+            database.ClearAll();
 
             dynamicEntries.Clear();
-
-            // 1) Layer由来のColliderを収集
             CollectLayerColliders();
-
-            // 2) KeepOut/SoftAvoidコンポーネントを収集（Layer不要）
             CollectZones();
+            CollectConditionalVolumes();
 
-            // 3) Static BVH & Dynamic Hash
             database.BuildStaticBVH();
             database.RebuildDynamicHash();
         }
@@ -64,18 +50,19 @@ namespace HighOrbitAI
             foreach (var col in cols)
             {
                 if (!col.enabled) continue;
+
                 var go = col.gameObject;
                 int layerBit = 1 << go.layer;
 
                 bool isDyn = (dynamicMask.value & layerBit) != 0;
                 bool isSta = (staticMask.value & layerBit) != 0;
 
-                // どちらにも入ってなければ無視
                 if (!isDyn && !isSta) continue;
 
-                // Zoneコンポーネントが付いてる場合は、Zones側で処理するので二重登録しない
+                // Zones/Conditional は別経路で収集する（重複登録を避ける）
                 if (go.GetComponent<KeepOutZone>() != null) continue;
                 if (go.GetComponent<SoftAvoidZone>() != null) continue;
+                if (go.GetComponent<ConditionalVolume>() != null) continue;
 
                 Bounds b = col.bounds;
                 var flags = NavFlags.Blocked | (isDyn ? NavFlags.Dynamic : NavFlags.None);
@@ -95,7 +82,6 @@ namespace HighOrbitAI
 
         void CollectZones()
         {
-            // KeepOut
             var keepOuts = FindObjectsByType<KeepOutZone>(FindObjectsSortMode.None);
             foreach (var kz in keepOuts)
             {
@@ -108,13 +94,9 @@ namespace HighOrbitAI
                     database.RegisterDynamic(id);
                     dynamicEntries.Add(new DynamicEntry { volumeId = id, keepOut = kz });
                 }
-                else
-                {
-                    database.RegisterStatic(id);
-                }
+                else database.RegisterStatic(id);
             }
 
-            // SoftAvoid
             var softs = FindObjectsByType<SoftAvoidZone>(FindObjectsSortMode.None);
             foreach (var sz in softs)
             {
@@ -127,17 +109,31 @@ namespace HighOrbitAI
                     database.RegisterDynamic(id);
                     dynamicEntries.Add(new DynamicEntry { volumeId = id, softAvoid = sz });
                 }
-                else
-                {
-                    database.RegisterStatic(id);
-                }
+                else database.RegisterStatic(id);
             }
         }
 
         /// <summary>
-        /// decisionHzなど低レートで呼ぶ。動いたDynamicのBoundsを更新→Hash再構築。
-        /// （最小実装として全再構築。必要なら差分更新に拡張可能）
+        /// 条件付きVolume（ドア/液体/イベント）を収集する。
+        /// ここで登録されたものは “動的” として扱い、UpdateDynamicVolumesで状態更新される。
         /// </summary>
+        void CollectConditionalVolumes()
+        {
+            var cvs = FindObjectsByType<ConditionalVolume>(FindObjectsSortMode.None);
+            foreach (var cv in cvs)
+            {
+                cv.GetCurrent(agentRadius, out Bounds b, out NavFlags flags, out float costAdd);
+
+                // 条件付きは常にDynamicとして扱う（状態が変わるため）
+                flags |= NavFlags.Dynamic;
+
+                int id = database.AddVolume(new VolumeLite(b, flags, costAdd));
+                database.RegisterDynamic(id);
+
+                dynamicEntries.Add(new DynamicEntry { volumeId = id, conditional = cv });
+            }
+        }
+
         public void UpdateDynamicVolumes()
         {
             for (int i = 0; i < dynamicEntries.Count; i++)
@@ -149,20 +145,24 @@ namespace HighOrbitAI
                     database.UpdateDynamicBounds(e.volumeId, e.collider.bounds);
                     continue;
                 }
-
                 if (e.keepOut != null)
                 {
                     database.UpdateDynamicBounds(e.volumeId, e.keepOut.GetInflatedBounds(agentRadius));
                     continue;
                 }
-
                 if (e.softAvoid != null)
                 {
                     database.UpdateDynamicBounds(e.volumeId, e.softAvoid.GetInflatedBounds(agentRadius));
                     continue;
                 }
+                if (e.conditional != null)
+                {
+                    e.conditional.GetCurrent(agentRadius, out Bounds b, out NavFlags flags, out float costAdd);
+                    flags |= NavFlags.Dynamic;
+                    database.UpdateDynamicAll(e.volumeId, b, flags, costAdd);
+                    continue;
+                }
             }
-
             database.RebuildDynamicHash();
         }
     }
