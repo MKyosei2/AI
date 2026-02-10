@@ -12,10 +12,8 @@ namespace HighOrbitAI
         public LogLevel logLevel = LogLevel.Info;
         public float logThrottleSeconds = 0.15f;
         public bool logEachDecisionTick = true;
-        public bool logPlanner = true;
 
         float lastLogTime = -999f;
-
         void Log(LogLevel lvl, string msg)
         {
             if (!logEnabled) return;
@@ -33,8 +31,6 @@ namespace HighOrbitAI
             else Debug.Log(prefix + msg);
         }
 
-        static string V3(Vector3 v) => $"({v.x:0.0},{v.y:0.0},{v.z:0.0})";
-
         static float PathLength(IReadOnlyList<Vector3> pts)
         {
             if (pts == null || pts.Count < 2) return 0f;
@@ -51,6 +47,16 @@ namespace HighOrbitAI
         public Transform combatTarget;
         public MonoBehaviour combatStateProvider;
         ICombatStateProvider combat;
+
+        [Header("Threat (Optional)")]
+        public MonoBehaviour threatSignalProvider;
+        IThreatSignalProvider threat;
+
+        [Header("Targeting (Next-Gen)")]
+        public bool autoAcquireTarget = true;
+        [Tooltip("ITargetProvider を実装したコンポーネント（例：AutoTargetProvider）")]
+        public MonoBehaviour targetProvider;
+        ITargetProvider targeter;
 
         public enum RouteMode { Waypoints, RandomRoam }
         [Header("Route Source (Non-Combat)")]
@@ -123,13 +129,16 @@ namespace HighOrbitAI
         public float DebugCeilingY { get; private set; }
         public bool DebugInKeepOut { get; private set; }
 
-        // ★追加：Combatデバッグ
         public bool DebugMelee { get; private set; }
         public bool DebugShooting { get; private set; }
         public bool DebugBoost { get; private set; }
         public bool DebugEvade { get; private set; }
 
+        public float DebugUnderFire01 { get; private set; }
+        public float DebugTargeted01 { get; private set; }
+
         public string DebugTactic { get; private set; }
+        public string DebugPhase { get; private set; }
         public TacticalDirector.AltitudeBand DebugBand { get; private set; }
 
         AIMode mode = AIMode.Lane;
@@ -167,6 +176,14 @@ namespace HighOrbitAI
             if (combatStateProvider != null) combat = combatStateProvider as ICombatStateProvider;
             if (combat == null) combat = GetComponent<ICombatStateProvider>();
 
+            threat = null;
+            if (threatSignalProvider != null) threat = threatSignalProvider as IThreatSignalProvider;
+            if (threat == null) threat = GetComponent<IThreatSignalProvider>();
+
+            targeter = null;
+            if (targetProvider != null) targeter = targetProvider as ITargetProvider;
+            if (targeter == null) targeter = GetComponent<ITargetProvider>(); // 同一GOに付けてもOK
+
             laneBuilder = new LowAltitudeLaneGraphBuilder
             {
                 nodeSpacing = laneNodeSpacing,
@@ -195,9 +212,10 @@ namespace HighOrbitAI
             DebugLastPlanOk = false;
             DebugLastPlanMessage = "Init";
             DebugTactic = "-";
+            DebugPhase = "-";
             DebugBand = TacticalDirector.AltitudeBand.Mid;
 
-            Log(LogLevel.Info, "Started (Route AI + Tactics).");
+            Log(LogLevel.Info, "Started (Route AI + Phase Tactics + Auto Target).");
         }
 
         void Update()
@@ -240,7 +258,7 @@ namespace HighOrbitAI
                 if (logEachDecisionTick && logLevel >= LogLevel.Info)
                 {
                     Log(LogLevel.Info,
-                        $"Tick mode={mode}, tactic={DebugTactic}, band={DebugBand}, target={V3(DebugTarget)}, goal={V3(DebugGoal)}, distXZ={DebugFlatDistance:0.0}, ok={DebugLastPlanOk}, msg={DebugLastPlanMessage}");
+                        $"Tick mode={mode}, phase={DebugPhase}, tactic={DebugTactic}, band={DebugBand}, underFire={DebugUnderFire01:0.00}, targeted={DebugTargeted01:0.00}, ok={DebugLastPlanOk}");
                 }
             }
 
@@ -370,15 +388,36 @@ namespace HighOrbitAI
 
         void ApplyTacticsIfActive()
         {
-            // combat flags debug update
             DebugMelee = combat != null && combat.IsMeleeEngaging;
             DebugShooting = combat != null && combat.IsShooting;
             DebugBoost = combat != null && combat.IsBoosting;
             DebugEvade = combat != null && combat.IsEvading;
 
+            DebugUnderFire01 = threat != null ? Mathf.Clamp01(threat.UnderFire01) : 0f;
+            DebugTargeted01 = threat != null ? Mathf.Clamp01(threat.Targeted01) : 0f;
+
+            // ★ 自動ターゲット選択
+            if (autoAcquireTarget && targeter != null)
+            {
+                var q = new TargetQuery
+                {
+                    self = transform,
+                    selfForward = transform.forward,
+                    db = (volumeCollector != null) ? volumeCollector.database : null,
+                    agentRadius = agentRadius,
+                    underFire01 = DebugUnderFire01,
+                    targeted01 = DebugTargeted01,
+                    currentTarget = combatTarget,
+                    nowTime = Time.time
+                };
+
+                combatTarget = targeter.SelectTarget(in q);
+            }
+
             if (!enableTactics || combatTarget == null)
             {
                 DebugTactic = "-";
+                DebugPhase = tactics.CurrentPhase.ToString();
                 DebugBand = TacticalDirector.AltitudeBand.Mid;
                 return;
             }
@@ -388,6 +427,7 @@ namespace HighOrbitAI
             if (distXZ > tacticsActivateDistXZ)
             {
                 DebugTactic = "-";
+                DebugPhase = tactics.CurrentPhase.ToString();
                 DebugBand = TacticalDirector.AltitudeBand.High;
                 return;
             }
@@ -403,9 +443,12 @@ namespace HighOrbitAI
                 agentRadius,
                 DebugInKeepOut,
                 combat,
+                DebugUnderFire01,
+                DebugTargeted01,
                 Time.time);
 
             DebugTactic = res.tactic.ToString();
+            DebugPhase = res.phase.ToString();
             DebugBand = res.band;
 
             currentTarget = res.targetPos;
@@ -507,10 +550,7 @@ namespace HighOrbitAI
                 path.AddRange(lanePath);
                 path.Add(goal);
                 controller.SetPath(path);
-
                 DebugLastPlanMessage = $"Lane: path={path.Count}";
-                if (logPlanner && logLevel >= LogLevel.Info)
-                    Log(LogLevel.Info, $"PlanLane OK pts={path.Count} len={PathLength(path):0.0}");
             }
             else
             {
@@ -531,8 +571,8 @@ namespace HighOrbitAI
                 transform.position, goal,
                 volumeCollector.database,
                 agentRadius,
-                controller.maxClimbRate,
-                controller.maxSpeed,
+                controller.cruise.maxClimbRate,
+                controller.cruise.maxSpeed,
                 DebugDesiredY,
                 DebugCeilingY,
                 seed,
@@ -547,10 +587,7 @@ namespace HighOrbitAI
                 path.Add(transform.position);
                 path.AddRange(localPath);
                 controller.SetPath(path);
-
                 DebugLastPlanMessage = $"Terminal: path={path.Count}";
-                if (logPlanner && logLevel >= LogLevel.Info)
-                    Log(LogLevel.Info, $"PlanLocal OK pts={path.Count} len={PathLength(path):0.0}");
             }
             else
             {
@@ -583,7 +620,6 @@ namespace HighOrbitAI
             Vector3 fwd = transform.forward;
             Vector3 right = transform.right;
             Vector3 push = (right * 0.8f) + (fwd * 0.2f) + (Vector3.up * 0.25f);
-
             controller.ApplyKeepOutPush(push, Time.deltaTime);
         }
     }

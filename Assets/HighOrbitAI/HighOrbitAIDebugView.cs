@@ -38,8 +38,8 @@ namespace HighOrbitAI
             pathLine = CreateLine("AI_PathLine", pathLineWidth);
             velLine  = CreateLine("AI_VelLine",  velLineWidth);
 
-            mTarget = CreateMarker("Target", new Color(0.2f, 0.9f, 1f), markerScale).transform; // cyan
-            mGoal   = CreateMarker("Goal",   new Color(1f, 0.2f, 1f), markerScale).transform;   // magenta
+            mTarget = CreateMarker("Target", new Color(0.2f, 0.9f, 1f), markerScale).transform;
+            mGoal   = CreateMarker("Goal",   new Color(1f, 0.2f, 1f), markerScale).transform;
 
             label = CreateWorldText("AI_StateText");
         }
@@ -111,6 +111,7 @@ namespace HighOrbitAI
 
             label.text =
                 "[" + modeStr + "] " + okStr + "  " + koStr + "\n" +
+                "Phase:" + ai.DebugPhase + "  Tactic:" + ai.DebugTactic + "  Band:" + ai.DebugBand + "\n" +
                 "Combat(MSBE):" + combat + "\n" +
                 "Profile:" + controller.CurrentProfile + " -> " + controller.TargetProfile + "\n" +
                 "DistXZ:" + ai.DebugFlatDistance.ToString("0.0") + "\n" +
