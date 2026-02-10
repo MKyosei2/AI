@@ -3,36 +3,16 @@ using UnityEngine;
 
 namespace HighOrbitAI
 {
-    /// <summary>
-    /// 非戦闘時（巡回/移動/探索）に使う “ルートAI”。
-    /// - NavMesh不使用
-    /// - 低高度ポリシー（空中戦に見えない）
-    /// - 遠距離：低高度LaneGraph（2.5D的）で大局ルート
-    /// - 近距離：ローカル3Dグリッドで詰め
-    /// - ログで「何をどう考えたか」を出せる
-    ///
-    /// 追跡対象（プレイヤー）は不要：
-    /// - Waypoints（Transform配列）を順番/ランダムで巡回
-    /// - または RandomRoam（ワールド内ランダム目的地）
-    /// </summary>
     public class HighOrbitAI : MonoBehaviour
     {
-        // -----------------------
-        // Logging
-        // -----------------------
         public enum LogLevel { Off = 0, Error = 1, Warn = 2, Info = 3, Verbose = 4 }
 
-        [Header("Logging (What AI is thinking)")]
+        [Header("Logging")]
         public bool logEnabled = true;
         public LogLevel logLevel = LogLevel.Info;
-        [Tooltip("同じようなログを出し過ぎないための間引き（秒）")]
         public float logThrottleSeconds = 0.15f;
-        [Tooltip("Decision tickごとに出すか（Info以上で有効）。falseなら重要イベントだけ。")]
         public bool logEachDecisionTick = true;
-        public bool logGoalSelect = true;
         public bool logPlanner = true;
-        public bool logModeChange = true;
-        public bool logKeepOut = true;
 
         float lastLogTime = -999f;
 
@@ -46,7 +26,7 @@ namespace HighOrbitAI
                 return;
 
             lastLogTime = now;
-            string prefix = $"[RouteAI:{name}] ";
+            string prefix = $"[AI:{name}] ";
 
             if (lvl == LogLevel.Error) Debug.LogError(prefix + msg);
             else if (lvl == LogLevel.Warn) Debug.LogWarning(prefix + msg);
@@ -63,34 +43,26 @@ namespace HighOrbitAI
             return sum;
         }
 
-        // -----------------------
-        // Refs
-        // -----------------------
         [Header("Refs")]
         public VolumeCollector volumeCollector;
         public FlightController controller;
 
-        // -----------------------
-        // Route / Goal Source (Non-Combat)
-        // -----------------------
-        public enum RouteMode { Waypoints, RandomRoam }
+        [Header("Combat (Optional)")]
+        public Transform combatTarget;
+        public MonoBehaviour combatStateProvider;
+        ICombatStateProvider combat;
 
+        public enum RouteMode { Waypoints, RandomRoam }
         [Header("Route Source (Non-Combat)")]
         public RouteMode routeMode = RouteMode.Waypoints;
 
-        [Tooltip("巡回点。空なら RoutePath を探すか、自動でランダム移動にフォールバックします。")]
         public Transform[] waypoints;
-
-        [Tooltip("Waypointsを持つ親。指定すると子Transformを順番にWaypointsとして使います。")]
         public Transform waypointRoot;
 
         public bool loopWaypoints = true;
         public bool shuffleWaypoints = false;
 
-        [Tooltip("目的地に到達したとみなす2D距離（XZ）")]
         public float waypointReachDistXZ = 12f;
-
-        [Tooltip("目的地を次に切り替える最小間隔（秒）。連続で切り替わるのを防ぐ。")]
         public float minSecondsBetweenGoalSwitch = 0.75f;
 
         [Header("Random Roam")]
@@ -99,13 +71,10 @@ namespace HighOrbitAI
         public float roamMinSegment = 220f;
         public float roamMaxSegment = 520f;
 
-        // -----------------------
-        // Decision / Policy
-        // -----------------------
         [Header("Decision")]
         public float decisionHz = 20f;
 
-        [Header("Altitude Policy (anti-air-combat)")]
+        [Header("Altitude Policy (Base)")]
         public float lowHeight = 10f;
         public float ceilingAboveGround = 35f;
         public float minAboveGround = 3f;
@@ -117,10 +86,7 @@ namespace HighOrbitAI
         [Header("Route Planning")]
         public float agentRadius = 0.8f;
 
-        [Tooltip("この距離より遠いならLaneGraph（大局）。")]
         public float laneRange = 260f;
-
-        [Tooltip("この距離より近いならローカル3D（Terminal）。")]
         public float terminalRange = 160f;
 
         [Header("Lane Graph")]
@@ -131,13 +97,20 @@ namespace HighOrbitAI
         public float localCellSize = 6f;
         public float localRadius = 140f;
 
-        [Header("Variety (same shortest cost)")]
+        [Header("Variety")]
         public float tieEpsilon = 0.02f;
         public float varietyPeriod = 2.0f;
 
-        // -----------------------
-        // Debug exposed
-        // -----------------------
+        [Header("Tactics (Next-Gen)")]
+        public bool enableTactics = true;
+        public float tacticsActivateDistXZ = 600f;
+
+        public float bandLowAdd = 0f;
+        public float bandMidAdd = 25f;
+        public float bandHighAdd = 80f;
+
+        TacticalDirector tactics = new TacticalDirector();
+
         public enum AIMode { Lane, Terminal }
         public AIMode CurrentMode => mode;
 
@@ -150,13 +123,17 @@ namespace HighOrbitAI
         public float DebugCeilingY { get; private set; }
         public bool DebugInKeepOut { get; private set; }
 
-        public int DebugWaypointIndex => waypointIndex;
-        public int DebugWaypointCount => cachedWaypoints.Count;
+        // ★追加：Combatデバッグ
+        public bool DebugMelee { get; private set; }
+        public bool DebugShooting { get; private set; }
+        public bool DebugBoost { get; private set; }
+        public bool DebugEvade { get; private set; }
+
+        public string DebugTactic { get; private set; }
+        public TacticalDirector.AltitudeBand DebugBand { get; private set; }
 
         AIMode mode = AIMode.Lane;
-        AIMode lastMode;
 
-        // planners
         LowAltitudeLaneGraph laneGraph;
         LowAltitudeLaneGraphBuilder laneBuilder;
         AStarLaneVariety laneAstar;
@@ -165,13 +142,11 @@ namespace HighOrbitAI
         readonly List<Vector3> lanePath = new List<Vector3>(256);
         readonly List<Vector3> localPath = new List<Vector3>(256);
 
-        // runtime state
         readonly List<Transform> cachedWaypoints = new List<Transform>(128);
         int waypointIndex = 0;
 
         float decisionTimer;
         bool graphReady;
-        bool lastInKeepOut;
         int lastDbRevision;
         Bounds cachedWorldBounds;
 
@@ -188,6 +163,10 @@ namespace HighOrbitAI
         {
             if (controller == null) controller = GetComponent<FlightController>();
 
+            combat = null;
+            if (combatStateProvider != null) combat = combatStateProvider as ICombatStateProvider;
+            if (combat == null) combat = GetComponent<ICombatStateProvider>();
+
             laneBuilder = new LowAltitudeLaneGraphBuilder
             {
                 nodeSpacing = laneNodeSpacing,
@@ -200,20 +179,25 @@ namespace HighOrbitAI
 
             laneAstar = new AStarLaneVariety { tieEpsilon = tieEpsilon, validateEdgesWithDb = true };
             if (volumeCollector != null) laneAstar.database = volumeCollector.database;
-            localPlanner = new LocalGridPlannerVariety { cellSize = localCellSize, localRadius = localRadius, tieEpsilon = tieEpsilon };
 
-            DebugLastPlanOk = false;
-            DebugLastPlanMessage = "Init";
-
-            lastMode = mode;
-            lastInKeepOut = false;
+            localPlanner = new LocalGridPlannerVariety
+            {
+                cellSize = localCellSize,
+                localRadius = localRadius,
+                tieEpsilon = tieEpsilon
+            };
 
             BuildWaypointCache();
             EnsureInitialTarget();
 
             lastDbRevision = (volumeCollector != null && volumeCollector.database != null) ? volumeCollector.database.revision : 0;
 
-            Log(LogLevel.Info, "Started (Non-Combat Route AI).");
+            DebugLastPlanOk = false;
+            DebugLastPlanMessage = "Init";
+            DebugTactic = "-";
+            DebugBand = TacticalDirector.AltitudeBand.Mid;
+
+            Log(LogLevel.Info, "Started (Route AI + Tactics).");
         }
 
         void Update()
@@ -221,101 +205,68 @@ namespace HighOrbitAI
             if (volumeCollector == null || volumeCollector.database == null || controller == null)
                 return;
 
-            // 動的/条件付きVolume更新
             volumeCollector.UpdateDynamicVolumes();
 
-            // DB更新検知→次tickで再プラン誘発
             int revNow = volumeCollector.database.revision;
             if (revNow != lastDbRevision)
             {
                 lastDbRevision = revNow;
-                decisionTimer = 999f; // force
+                decisionTimer = 999f;
             }
 
-            // Decision tick
             decisionTimer += Time.deltaTime;
             if (decisionTimer >= (1f / Mathf.Max(1f, decisionHz)))
             {
                 decisionTimer = 0f;
 
                 EnsureLaneGraph();
-                SelectGoalAndMode();
+                SelectNonCombatTarget();
+                ApplyTacticsIfActive();
 
-                // Plan
+                currentGoal = BuildGoalFromTarget(currentTarget, DebugBand);
+                DebugTarget = currentTarget;
+                DebugGoal = currentGoal;
+
+                float dx = currentGoal.x - transform.position.x;
+                float dz = currentGoal.z - transform.position.z;
+                DebugFlatDistance = Mathf.Sqrt(dx * dx + dz * dz);
+
+                if (DebugFlatDistance >= laneRange) mode = AIMode.Lane;
+                else if (DebugFlatDistance <= terminalRange) mode = AIMode.Terminal;
+
                 if (mode == AIMode.Lane) PlanLane(currentGoal);
                 else PlanLocal(currentGoal);
 
                 if (logEachDecisionTick && logLevel >= LogLevel.Info)
                 {
                     Log(LogLevel.Info,
-                        $"Tick mode={mode}, target={V3(DebugTarget)}, goal={V3(DebugGoal)}, distXZ={DebugFlatDistance:0.0}, ok={DebugLastPlanOk}, msg={DebugLastPlanMessage}");
+                        $"Tick mode={mode}, tactic={DebugTactic}, band={DebugBand}, target={V3(DebugTarget)}, goal={V3(DebugGoal)}, distXZ={DebugFlatDistance:0.0}, ok={DebugLastPlanOk}, msg={DebugLastPlanMessage}");
                 }
             }
-
-            // ★ Next-Gen（追加）：状況に応じて機体ハンドリングを一時的に変える
-            ApplyProfileHint();
 
             controller.Tick(Time.deltaTime);
             EnforceKeepOut();
         }
 
-        // -----------------------
-        // Goal selection & mode
-        // -----------------------
-        void SelectGoalAndMode()
+        void SelectNonCombatTarget()
         {
-            // target selection
             if (routeMode == RouteMode.RandomRoam)
             {
                 if (ShouldSwitchGoalXZ(currentTarget))
-                {
                     currentTarget = PickRandomRoamTarget();
-                    if (logGoalSelect) Log(LogLevel.Info, $"Roam target -> {V3(currentTarget)}");
-                }
+                return;
             }
-            else
+
+            if (cachedWaypoints.Count == 0)
             {
-                if (cachedWaypoints.Count == 0)
-                {
-                    // fallback
-                    routeMode = RouteMode.RandomRoam;
-                    currentTarget = PickRandomRoamTarget();
-                    if (logGoalSelect) Log(LogLevel.Warn, "No waypoints found -> RandomRoam fallback");
-                }
-                else
-                {
-                    var wp = cachedWaypoints[waypointIndex];
-                    currentTarget = wp.position;
-
-                    if (ShouldSwitchGoalXZ(currentTarget))
-                    {
-                        AdvanceWaypoint();
-                        currentTarget = cachedWaypoints[waypointIndex].position;
-                        if (logGoalSelect) Log(LogLevel.Info, $"Waypoint -> idx={waypointIndex}/{cachedWaypoints.Count} pos={V3(currentTarget)}");
-                    }
-                }
+                routeMode = RouteMode.RandomRoam;
+                currentTarget = PickRandomRoamTarget();
+                return;
             }
 
-            // build goal (altitude policy)
-            currentGoal = BuildGoalFromTarget(currentTarget);
-
-            DebugTarget = currentTarget;
-            DebugGoal = currentGoal;
-
-            // mode selection by flat distance
-            float dx = currentGoal.x - transform.position.x;
-            float dz = currentGoal.z - transform.position.z;
-            DebugFlatDistance = Mathf.Sqrt(dx * dx + dz * dz);
-
-            AIMode newMode = mode;
-
-            if (DebugFlatDistance >= laneRange) newMode = AIMode.Lane;
-            else if (DebugFlatDistance <= terminalRange) newMode = AIMode.Terminal;
-
-            if (logModeChange && newMode != mode)
-                Log(LogLevel.Info, $"ModeChange {mode} -> {newMode} (distXZ={DebugFlatDistance:0.0})");
-
-            mode = newMode;
+            currentTarget = cachedWaypoints[waypointIndex].position;
+            if (ShouldSwitchGoalXZ(currentTarget))
+                AdvanceWaypoint();
         }
 
         bool ShouldSwitchGoalXZ(Vector3 target)
@@ -333,9 +284,6 @@ namespace HighOrbitAI
             if (routeMode == RouteMode.RandomRoam)
             {
                 currentTarget = PickRandomRoamTarget();
-                currentGoal = BuildGoalFromTarget(currentTarget);
-                DebugTarget = currentTarget;
-                DebugGoal = currentGoal;
                 return;
             }
 
@@ -343,17 +291,11 @@ namespace HighOrbitAI
             {
                 routeMode = RouteMode.RandomRoam;
                 currentTarget = PickRandomRoamTarget();
-                currentGoal = BuildGoalFromTarget(currentTarget);
-                DebugTarget = currentTarget;
-                DebugGoal = currentGoal;
                 return;
             }
 
             waypointIndex = Mathf.Clamp(waypointIndex, 0, cachedWaypoints.Count - 1);
             currentTarget = cachedWaypoints[waypointIndex].position;
-            currentGoal = BuildGoalFromTarget(currentTarget);
-            DebugTarget = currentTarget;
-            DebugGoal = currentGoal;
         }
 
         void AdvanceWaypoint()
@@ -363,6 +305,7 @@ namespace HighOrbitAI
             if (shuffleWaypoints)
             {
                 waypointIndex = Random.Range(0, cachedWaypoints.Count);
+                currentTarget = cachedWaypoints[waypointIndex].position;
                 return;
             }
 
@@ -372,11 +315,10 @@ namespace HighOrbitAI
                 if (loopWaypoints) waypointIndex = 0;
                 else waypointIndex = cachedWaypoints.Count - 1;
             }
+
+            currentTarget = cachedWaypoints[waypointIndex].position;
         }
 
-        // -----------------------
-        // Waypoint cache
-        // -----------------------
         void BuildWaypointCache()
         {
             cachedWaypoints.Clear();
@@ -405,19 +347,8 @@ namespace HighOrbitAI
                         if (rp.points[i] != null) cachedWaypoints.Add(rp.points[i]);
                 }
             }
-
-            if (cachedWaypoints.Count == 0 && autoEstimateRoamBoundsFromColliders)
-            {
-                // no-op (bounds estimation happens in EnsureLaneGraph)
-            }
-
-            if (cachedWaypoints.Count == 0 && routeMode == RouteMode.Waypoints)
-                Log(LogLevel.Warn, "Waypoints empty. Will fallback to RandomRoam at runtime.");
         }
 
-        // -----------------------
-        // Random roam
-        // -----------------------
         Vector3 PickRandomRoamTarget()
         {
             if (autoEstimateRoamBoundsFromColliders && cachedWorldBounds.size.sqrMagnitude > 1f)
@@ -437,26 +368,76 @@ namespace HighOrbitAI
             return p;
         }
 
-        // -----------------------
-        // Altitude policy
-        // -----------------------
-        Vector3 BuildGoalFromTarget(Vector3 target)
+        void ApplyTacticsIfActive()
+        {
+            // combat flags debug update
+            DebugMelee = combat != null && combat.IsMeleeEngaging;
+            DebugShooting = combat != null && combat.IsShooting;
+            DebugBoost = combat != null && combat.IsBoosting;
+            DebugEvade = combat != null && combat.IsEvading;
+
+            if (!enableTactics || combatTarget == null)
+            {
+                DebugTactic = "-";
+                DebugBand = TacticalDirector.AltitudeBand.Mid;
+                return;
+            }
+
+            Vector3 to = combatTarget.position - transform.position;
+            float distXZ = Mathf.Sqrt(to.x * to.x + to.z * to.z);
+            if (distXZ > tacticsActivateDistXZ)
+            {
+                DebugTactic = "-";
+                DebugBand = TacticalDirector.AltitudeBand.High;
+                return;
+            }
+
+            volumeCollector.database.EvaluatePoint(transform.position, agentRadius, out var flags, out _);
+            DebugInKeepOut = (flags & NavFlags.KeepOut) != 0;
+
+            var res = tactics.Decide(
+                transform.position,
+                transform.forward,
+                combatTarget,
+                volumeCollector.database,
+                agentRadius,
+                DebugInKeepOut,
+                combat,
+                Time.time);
+
+            DebugTactic = res.tactic.ToString();
+            DebugBand = res.band;
+
+            currentTarget = res.targetPos;
+
+            controller.SetProfile(res.profile, res.profileHold);
+            controller.SetExtraSteer(res.extraSteer);
+        }
+
+        Vector3 BuildGoalFromTarget(Vector3 target, TacticalDirector.AltitudeBand band)
         {
             float groundY;
             bool hasGround = GroundSampler.TryGetGroundY(target, groundCastHeight, groundMaxDistance, groundMask, out groundY);
             if (!hasGround) groundY = target.y;
 
-            float desiredY = Mathf.Clamp(groundY + lowHeight, groundY + minAboveGround, groundY + ceilingAboveGround);
-            float ceilingY = groundY + ceilingAboveGround;
+            float add =
+                band == TacticalDirector.AltitudeBand.Low ? bandLowAdd :
+                band == TacticalDirector.AltitudeBand.High ? bandHighAdd :
+                bandMidAdd;
+
+            float desiredY = Mathf.Clamp(
+                groundY + lowHeight + add,
+                groundY + minAboveGround,
+                groundY + ceilingAboveGround + add);
+
+            float ceilingY = groundY + ceilingAboveGround + add;
+
             DebugDesiredY = desiredY;
             DebugCeilingY = ceilingY;
 
             return new Vector3(target.x, desiredY, target.z);
         }
 
-        // -----------------------
-        // Planning
-        // -----------------------
         void EnsureLaneGraph()
         {
             if (graphReady) return;
@@ -467,14 +448,8 @@ namespace HighOrbitAI
             laneBuilder.nodeSpacing = laneNodeSpacing;
             laneBuilder.edgeMaxDistance = laneEdgeMaxDist;
 
-            float t0 = Time.realtimeSinceStartup;
             laneGraph = laneBuilder.Build(cachedWorldBounds, lowHeight, ceilingAboveGround, volumeCollector.database, agentRadius);
-            float dt = (Time.realtimeSinceStartup - t0) * 1000f;
-
             graphReady = (laneGraph != null && laneGraph.nodes.Count > 0);
-
-            if (graphReady) Log(LogLevel.Info, $"LaneGraph built: nodes={laneGraph.nodes.Count}, edges={laneGraph.edges.Count}, spacing={laneNodeSpacing}, buildTime={dt:0.0}ms");
-            else Log(LogLevel.Warn, "LaneGraph build failed: no nodes (check groundMask / KeepOut coverage / world bounds).");
         }
 
         Bounds EstimateWorldBounds()
@@ -506,7 +481,6 @@ namespace HighOrbitAI
                 DebugLastPlanOk = false;
                 DebugLastPlanMessage = "Lane: graph not ready";
                 controller.SetPath(new List<Vector3> { transform.position, goal });
-                if (logPlanner) Log(LogLevel.Warn, "PlanLane: graph not ready -> direct");
                 return;
             }
 
@@ -517,17 +491,13 @@ namespace HighOrbitAI
                 DebugLastPlanOk = false;
                 DebugLastPlanMessage = "Lane: no nodes";
                 controller.SetPath(new List<Vector3> { transform.position, goal });
-                if (logPlanner) Log(LogLevel.Warn, $"PlanLane: no nodes (start={start}, end={end}) -> direct");
                 return;
             }
 
             int seed = ComputeVarietySeed();
             laneAstar.tieEpsilon = tieEpsilon;
 
-            float t0 = Time.realtimeSinceStartup;
             bool ok = laneAstar.FindPath(laneGraph, start, end, seed, lanePath);
-            float dt = (Time.realtimeSinceStartup - t0) * 1000f;
-
             DebugLastPlanOk = ok;
 
             if (ok)
@@ -538,18 +508,14 @@ namespace HighOrbitAI
                 path.Add(goal);
                 controller.SetPath(path);
 
-                float len = PathLength(path);
                 DebugLastPlanMessage = $"Lane: path={path.Count}";
-
                 if (logPlanner && logLevel >= LogLevel.Info)
-                    Log(LogLevel.Info, $"PlanLane: OK pts={path.Count}, len={len:0.0}, tieEps={tieEpsilon:0.000}, seed={seed}, compute={dt:0.0}ms");
+                    Log(LogLevel.Info, $"PlanLane OK pts={path.Count} len={PathLength(path):0.0}");
             }
             else
             {
                 controller.SetPath(new List<Vector3> { transform.position, goal });
                 DebugLastPlanMessage = "Lane: A* failed -> direct";
-
-                if (logPlanner) Log(LogLevel.Warn, $"PlanLane: FAIL -> direct (compute={dt:0.0}ms, start={start}, end={end})");
             }
         }
 
@@ -561,7 +527,6 @@ namespace HighOrbitAI
             localPlanner.localRadius = localRadius;
             localPlanner.tieEpsilon = tieEpsilon;
 
-            float t0 = Time.realtimeSinceStartup;
             bool ok = localPlanner.FindPath(
                 transform.position, goal,
                 volumeCollector.database,
@@ -573,7 +538,6 @@ namespace HighOrbitAI
                 seed,
                 localPath
             );
-            float dt = (Time.realtimeSinceStartup - t0) * 1000f;
 
             DebugLastPlanOk = ok;
 
@@ -584,18 +548,14 @@ namespace HighOrbitAI
                 path.AddRange(localPath);
                 controller.SetPath(path);
 
-                float len = PathLength(path);
                 DebugLastPlanMessage = $"Terminal: path={path.Count}";
-
                 if (logPlanner && logLevel >= LogLevel.Info)
-                    Log(LogLevel.Info, $"PlanLocal: OK pts={path.Count}, len={len:0.0}, cell={localCellSize}, rad={localRadius}, ceilY={DebugCeilingY:0.0}, seed={seed}, compute={dt:0.0}ms");
+                    Log(LogLevel.Info, $"PlanLocal OK pts={path.Count} len={PathLength(path):0.0}");
             }
             else
             {
                 controller.SetPath(new List<Vector3> { transform.position, goal });
                 DebugLastPlanMessage = "Terminal: A* failed -> direct";
-
-                if (logPlanner) Log(LogLevel.Warn, $"PlanLocal: FAIL -> direct (compute={dt:0.0}ms, cell={localCellSize}, rad={localRadius})");
             }
         }
 
@@ -616,51 +576,8 @@ namespace HighOrbitAI
             return best;
         }
 
-        // -----------------------
-        // Next-Gen（追加）：Profile hinting
-        // -----------------------
-        void ApplyProfileHint()
-        {
-            // FlightController が次世代版（SetProfileあり）の場合だけ効く
-            // ※古いFlightControllerでもコンパイルは通るように、SetProfileは必ず実装して下さい（下に全文あり）
-            if (controller == null) return;
-
-            // KeepOut内は抜けるのを最優先（Evadeを短くホールド）
-            var db = volumeCollector.database;
-            db.EvaluatePoint(transform.position, agentRadius, out var flags, out _);
-            if ((flags & NavFlags.KeepOut) != 0)
-            {
-                controller.SetProfile(FlightController.FlightProfile.Evade, 0.25f);
-                return;
-            }
-
-            // 近距離（Terminal）＝格闘レンジ想定でキビキビ
-            if (mode == AIMode.Terminal)
-            {
-                controller.SetProfile(FlightController.FlightProfile.EngageMelee, 0.20f);
-                return;
-            }
-
-            // 通常巡航
-            controller.SetProfile(FlightController.FlightProfile.Cruise);
-        }
-
-        // -----------------------
-        // KeepOut push
-        // -----------------------
         void EnforceKeepOut()
         {
-            var db = volumeCollector.database;
-            db.EvaluatePoint(transform.position, agentRadius, out var flags, out _);
-
-            DebugInKeepOut = (flags & NavFlags.KeepOut) != 0;
-
-            if (logKeepOut && DebugInKeepOut != lastInKeepOut)
-            {
-                Log(LogLevel.Warn, DebugInKeepOut ? "KeepOut: ENTER" : "KeepOut: EXIT");
-                lastInKeepOut = DebugInKeepOut;
-            }
-
             if (!DebugInKeepOut) return;
 
             Vector3 fwd = transform.forward;

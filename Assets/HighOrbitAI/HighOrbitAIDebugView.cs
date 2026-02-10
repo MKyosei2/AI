@@ -70,9 +70,9 @@ namespace HighOrbitAI
                 pathLine.SetPosition(i, p[i] + Vector3.up * 0.15f);
 
             if (ai.CurrentMode == HighOrbitAI.AIMode.Lane)
-                SetLineColor(pathLine, new Color(0.25f, 1f, 0.35f));    // green
+                SetLineColor(pathLine, new Color(0.25f, 1f, 0.35f));
             else
-                SetLineColor(pathLine, new Color(1f, 0.55f, 0.15f));    // orange
+                SetLineColor(pathLine, new Color(1f, 0.55f, 0.15f));
         }
 
         void DrawVelocity()
@@ -103,12 +103,18 @@ namespace HighOrbitAI
             string modeStr = ai.CurrentMode.ToString();
             string koStr = ai.DebugInKeepOut ? "KeepOut" : "-";
 
+            string combat =
+                (ai.DebugMelee ? "M" : "-") +
+                (ai.DebugShooting ? "S" : "-") +
+                (ai.DebugBoost ? "B" : "-") +
+                (ai.DebugEvade ? "E" : "-");
+
             label.text =
                 "[" + modeStr + "] " + okStr + "  " + koStr + "\n" +
-                "Profile:" + controller.CurrentProfile + " -> " + controller.TargetProfile + "\n" +   // ★追加
+                "Combat(MSBE):" + combat + "\n" +
+                "Profile:" + controller.CurrentProfile + " -> " + controller.TargetProfile + "\n" +
                 "DistXZ:" + ai.DebugFlatDistance.ToString("0.0") + "\n" +
                 "Alt:" + ai.DebugDesiredY.ToString("0.0") + "/" + ai.DebugCeilingY.ToString("0.0") + "\n" +
-                "WP:" + ai.DebugWaypointIndex + "/" + ai.DebugWaypointCount + "\n" +
                 ai.DebugLastPlanMessage + "\n" +
                 "Speed:" + controller.Velocity.magnitude.ToString("0.0");
 
@@ -154,16 +160,8 @@ namespace HighOrbitAI
                 var mat = new Material(Shader.Find("Sprites/Default"));
                 if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", color);
                 if (mat.HasProperty("_Color")) mat.SetColor("_Color", color);
-
-                if (mat.HasProperty("_EmissionColor"))
-                {
-                    mat.SetColor("_EmissionColor", color);
-                    mat.EnableKeyword("_EMISSION");
-                }
-
                 r.material = mat;
             }
-
             return go;
         }
 
