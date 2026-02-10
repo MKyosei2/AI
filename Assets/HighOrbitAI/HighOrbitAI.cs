@@ -52,9 +52,12 @@ namespace HighOrbitAI
         public MonoBehaviour threatSignalProvider;
         IThreatSignalProvider threat;
 
+        [Header("Squad (Next-Gen)")]
+        public string squadId = "alpha";
+        public SquadRole squadRole = SquadRole.Interceptor;
+
         [Header("Targeting (Next-Gen)")]
         public bool autoAcquireTarget = true;
-        [Tooltip("ITargetProvider を実装したコンポーネント（例：AutoTargetProvider）")]
         public MonoBehaviour targetProvider;
         ITargetProvider targeter;
 
@@ -91,7 +94,6 @@ namespace HighOrbitAI
 
         [Header("Route Planning")]
         public float agentRadius = 0.8f;
-
         public float laneRange = 260f;
         public float terminalRange = 160f;
 
@@ -163,6 +165,8 @@ namespace HighOrbitAI
         Vector3 currentTarget;
         Vector3 currentGoal;
 
+        int agentId;
+
         void Reset()
         {
             controller = GetComponent<FlightController>();
@@ -170,6 +174,9 @@ namespace HighOrbitAI
 
         void Start()
         {
+            agentId = GetInstanceID();
+            SquadCoordinator.Register(squadId, agentId, squadRole);
+
             if (controller == null) controller = GetComponent<FlightController>();
 
             combat = null;
@@ -182,7 +189,7 @@ namespace HighOrbitAI
 
             targeter = null;
             if (targetProvider != null) targeter = targetProvider as ITargetProvider;
-            if (targeter == null) targeter = GetComponent<ITargetProvider>(); // 同一GOに付けてもOK
+            if (targeter == null) targeter = GetComponent<ITargetProvider>();
 
             laneBuilder = new LowAltitudeLaneGraphBuilder
             {
@@ -215,7 +222,12 @@ namespace HighOrbitAI
             DebugPhase = "-";
             DebugBand = TacticalDirector.AltitudeBand.Mid;
 
-            Log(LogLevel.Info, "Started (Route AI + Phase Tactics + Auto Target).");
+            Log(LogLevel.Info, "Started (Next-Gen: Threat + Squad Tactics + Auto Target).");
+        }
+
+        void OnDestroy()
+        {
+            SquadCoordinator.Unregister(squadId, agentId);
         }
 
         void Update()
@@ -241,6 +253,9 @@ namespace HighOrbitAI
                 SelectNonCombatTarget();
                 ApplyTacticsIfActive();
 
+                // ★ squadに「今の狙い」を共有（群がり抑制の根）
+                SquadCoordinator.UpdateAssignment(squadId, agentId, combatTarget);
+
                 currentGoal = BuildGoalFromTarget(currentTarget, DebugBand);
                 DebugTarget = currentTarget;
                 DebugGoal = currentGoal;
@@ -258,7 +273,7 @@ namespace HighOrbitAI
                 if (logEachDecisionTick && logLevel >= LogLevel.Info)
                 {
                     Log(LogLevel.Info,
-                        $"Tick mode={mode}, phase={DebugPhase}, tactic={DebugTactic}, band={DebugBand}, underFire={DebugUnderFire01:0.00}, targeted={DebugTargeted01:0.00}, ok={DebugLastPlanOk}");
+                        $"Tick mode={mode}, phase={DebugPhase}, tactic={DebugTactic}, role={squadRole}, squad={squadId}, underFire={DebugUnderFire01:0.00}, targeted={DebugTargeted01:0.00}, ok={DebugLastPlanOk}");
                 }
             }
 
@@ -396,7 +411,7 @@ namespace HighOrbitAI
             DebugUnderFire01 = threat != null ? Mathf.Clamp01(threat.UnderFire01) : 0f;
             DebugTargeted01 = threat != null ? Mathf.Clamp01(threat.Targeted01) : 0f;
 
-            // ★ 自動ターゲット選択
+            // ★ 自動ターゲット（Squad/Threat aware）
             if (autoAcquireTarget && targeter != null)
             {
                 var q = new TargetQuery
@@ -407,6 +422,8 @@ namespace HighOrbitAI
                     agentRadius = agentRadius,
                     underFire01 = DebugUnderFire01,
                     targeted01 = DebugTargeted01,
+                    squadId = squadId,
+                    squadRole = squadRole,
                     currentTarget = combatTarget,
                     nowTime = Time.time
                 };
@@ -435,6 +452,7 @@ namespace HighOrbitAI
             volumeCollector.database.EvaluatePoint(transform.position, agentRadius, out var flags, out _);
             DebugInKeepOut = (flags & NavFlags.KeepOut) != 0;
 
+            // TacticalDirector 側は「敵の選択後」に動く（既存のままでOK）
             var res = tactics.Decide(
                 transform.position,
                 transform.forward,

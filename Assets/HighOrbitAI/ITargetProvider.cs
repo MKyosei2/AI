@@ -13,6 +13,9 @@ namespace HighOrbitAI
         public float underFire01;
         public float targeted01;
 
+        public string squadId;
+        public SquadRole squadRole;
+
         public Transform currentTarget;
         public float nowTime;
     }

@@ -2,40 +2,42 @@ using UnityEngine;
 
 namespace HighOrbitAI
 {
-    /// <summary>
-    /// 自動ターゲット選択：
-    /// - 距離（近いほど高得点）
-    /// - LoS（射線が通ると加点）
-    /// - 背後（背後を取れるなら加点）
-    /// - 上空逃げモード（UnderFire/Targetedが強い時は “遠め/上空へ逃げやすい” を優先）
-    /// - KeepOut/Blocked に近い候補は減点
-    /// </summary>
     public class AutoTargetProvider : MonoBehaviour, ITargetProvider
     {
         [Header("Search")]
         public float searchRadius = 800f;
         public LayerMask enemyMask = ~0;
-        [Tooltip("空ならタグ無視。設定したら一致するTagだけ候補にする。")]
         public string requiredTag = "";
-
-        [Tooltip("候補数（NonAllocバッファ）")]
         public int maxCandidates = 48;
 
-        [Header("Weights")]
+        [Header("Base Weights")]
         public float wDistance = 1.0f;
         public float wLos = 0.8f;
         public float wBehind = 0.6f;
         public float wKeepOutPenalty = 1.2f;
 
+        [Header("Threat Weights (Enemy)")]
+        public float wThreatWeapon = 0.8f;
+        public float wThreatHp = 0.35f;
+        public float wThreatLockOn = 1.0f;
+
+        [Header("Squad dispersion")]
+        [Tooltip("同じ敵に味方が集まるほど減点")]
+        public float wCrowdPenalty = 0.55f;
+
+        [Tooltip("同じ“役割”が同じ敵に集まるほど強めに減点")]
+        public float wSameRolePenalty = 0.35f;
+
+        [Header("Role preference")]
+        public float roleInterceptorDistanceMul = 1.15f; // 近距離寄り
+        public float roleGunnerLosMul = 1.25f;          // LoS寄り
+        public float roleSupportThreatMul = 1.15f;      // 高脅威狙い（分散でサポートが引き受ける等）
+
         [Header("Bias when under fire")]
-        [Tooltip("被弾中は近距離固執を弱める（上へ逃げやすいターゲット選択に寄せる）")]
         [Range(0f, 1f)] public float underFireBias = 0.6f;
 
         [Header("Switching")]
-        [Tooltip("このスコア差が無いとターゲットを切り替えない（フラつき防止）")]
         public float switchHysteresis = 0.18f;
-
-        [Tooltip("最短での切替間隔（秒）")]
         public float minSwitchInterval = 0.75f;
 
         Collider[] buf;
@@ -53,7 +55,6 @@ namespace HighOrbitAI
             float now = q.nowTime;
             bool canSwitch = now >= nextSwitchTime;
 
-            // 既存ターゲットのスコアを先に計算（ヒステリシス用）
             float currentScore = float.NegativeInfinity;
             if (q.currentTarget != null)
                 currentScore = Score(q, q.currentTarget);
@@ -83,7 +84,6 @@ namespace HighOrbitAI
                 }
             }
 
-            // 切替判定（ヒステリシス + インターバル）
             if (best != q.currentTarget && canSwitch)
             {
                 if (bestScore >= currentScore + switchHysteresis)
@@ -105,38 +105,29 @@ namespace HighOrbitAI
             float dist = d.magnitude;
             if (dist < 0.001f) dist = 0.001f;
 
-            // 距離スコア：近いほど高得点（0..1-ish）
             float dist01 = Mathf.Clamp01(1f - (dist / searchRadius));
             float distScore = dist01 * wDistance;
 
-            // 被弾/狙われ中は「近距離固執」を弱める
-            float danger = Mathf.Clamp01(Mathf.Max(q.underFire01, q.targeted01));
-            distScore *= Mathf.Lerp(1f, 1f - underFireBias, danger);
+            // 危険時は“近さ”への固執を落とす
+            float dangerSelf = Mathf.Clamp01(Mathf.Max(q.underFire01, q.targeted01));
+            distScore *= Mathf.Lerp(1f, 1f - underFireBias, dangerSelf);
 
             // LoS
-            float losScore = 0f;
+            float los01 = 1f;
             if (q.db != null)
-            {
-                bool blocked = q.db.SegmentHitsHardAny(selfPos, enemyPos);
-                losScore = blocked ? 0f : 1f;
-            }
-            else
-            {
-                losScore = 1f;
-            }
-            losScore *= wLos;
+                los01 = q.db.SegmentHitsHardAny(selfPos, enemyPos) ? 0f : 1f;
+            float losScore = los01 * wLos;
 
-            // 背後（敵の forward と「敵→自分」の向きで判定）
+            // 背後
             float behindScore = 0f;
             {
                 Vector3 enemyFwd = enemy.forward;
                 Vector3 enemyToSelf = (selfPos - enemyPos).normalized;
-                // 敵が向いてる方向と逆向き（=背後側）ほど大きい
-                float behind01 = Mathf.Clamp01(Vector3.Dot(enemyFwd, enemyToSelf)); // 1=完全に背後
+                float behind01 = Mathf.Clamp01(Vector3.Dot(enemyFwd, enemyToSelf)); // 1=背後
                 behindScore = behind01 * wBehind;
             }
 
-            // KeepOut/Blocked 近傍ペナルティ（候補点が危険なら減点）
+            // KeepOut/Blocked ペナルティ
             float penalty = 0f;
             if (q.db != null)
             {
@@ -146,10 +137,50 @@ namespace HighOrbitAI
             }
             penalty *= wKeepOutPenalty;
 
-            // 危険時は「LoS/背後」をより評価（上空逃げしつつ“通る相手/背後取れる相手”）
-            float dangerMul = Mathf.Lerp(1f, 1.25f, danger);
+            // ---- Enemy Threat（武器/HP/ロックオン）----
+            float threat = 0f;
+            var ti = enemy.GetComponent<IThreatInfoProvider>();
+            if (ti != null)
+            {
+                threat =
+                    ti.WeaponThreat01 * wThreatWeapon +
+                    ti.Hp01 * wThreatHp +
+                    ti.LockOnThreat01 * wThreatLockOn;
+            }
 
-            return (distScore + (losScore + behindScore) * dangerMul) - penalty;
+            // ---- Squad dispersion（群がり抑制）----
+            int crowd = SquadCoordinator.CountAssigned(q.squadId, enemy);
+            int sameRole = SquadCoordinator.CountAssignedByRole(q.squadId, enemy, q.squadRole);
+
+            float crowdPenalty = crowd * wCrowdPenalty + sameRole * wSameRolePenalty;
+
+            // ---- Role preference ----
+            float roleMulDist = 1f;
+            float roleMulLos = 1f;
+            float roleMulThreat = 1f;
+
+            switch (q.squadRole)
+            {
+                case SquadRole.Interceptor:
+                    roleMulDist = roleInterceptorDistanceMul;
+                    break;
+                case SquadRole.Gunner:
+                    roleMulLos = roleGunnerLosMul;
+                    break;
+                case SquadRole.Support:
+                    roleMulThreat = roleSupportThreatMul;
+                    break;
+            }
+
+            // 危険時ほど“脅威”と“射線”を重視（Support/Gunnerが働きやすい）
+            float dangerMul = Mathf.Lerp(1f, 1.25f, dangerSelf);
+
+            float baseScore =
+                (distScore * roleMulDist) +
+                ((losScore * roleMulLos) + behindScore) * dangerMul +
+                (threat * roleMulThreat) * dangerMul;
+
+            return baseScore - penalty - crowdPenalty;
         }
 
         void OnValidate()
