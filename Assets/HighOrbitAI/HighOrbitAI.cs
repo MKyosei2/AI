@@ -220,82 +220,173 @@ namespace HighOrbitAI
         {
             if (volumeCollector == null || volumeCollector.database == null || controller == null)
                 return;
-// ensure validator sees latest DB (after domain reload etc.)
-if (laneAstar != null && laneAstar.database == null)
-    laneAstar.database = volumeCollector.database;
 
-// if conditional/dynamic state changed, accelerate next decision tick
-int revNow = volumeCollector.database.revision;
-if (revNow != lastDbRevision)
-{
-    if (logEnabled && logLevel >= LogLevel.Info)
-        Log(LogLevel.Info, $"DB revision changed: {lastDbRevision} -> {revNow} (conditional/dynamic update)");
-    lastDbRevision = revNow;
+            // 動的/条件付きVolume更新
+            volumeCollector.UpdateDynamicVolumes();
 
-    // force a quick re-plan on next frame
-    decisionTimer = 1f / Mathf.Max(1f, decisionHz);
-}
-
-
-            DebugFlatDistance = Vector2.Distance(
-                new Vector2(transform.position.x, transform.position.z),
-                new Vector2(currentTarget.x, currentTarget.z)
-            );
-
-            // mode selection by distance to currentTarget
-            if (DebugFlatDistance < terminalRange) mode = AIMode.Terminal;
-            else if (DebugFlatDistance > laneRange) mode = AIMode.Lane;
-
-            if (logModeChange && mode != lastMode)
+            // DB更新検知→次tickで再プラン誘発
+            int revNow = volumeCollector.database.revision;
+            if (revNow != lastDbRevision)
             {
-                Log(LogLevel.Info, $"ModeChange: {lastMode} -> {mode} (flatDist={DebugFlatDistance:0.0}, terminal<{terminalRange}, lane>{laneRange})");
-                lastMode = mode;
+                lastDbRevision = revNow;
+                decisionTimer = 999f; // force
             }
 
+            // Decision tick
             decisionTimer += Time.deltaTime;
-            if (decisionTimer >= 1f / Mathf.Max(1f, decisionHz))
+            if (decisionTimer >= (1f / Mathf.Max(1f, decisionHz)))
             {
                 decisionTimer = 0f;
 
-                volumeCollector.UpdateDynamicVolumes();
                 EnsureLaneGraph();
+                SelectGoalAndMode();
 
-                // select/advance target if needed
-                MaybeAdvanceTarget();
-
-                // compute goal with altitude constraints
-                currentGoal = BuildGoalFromTarget(currentTarget);
-                DebugTarget = currentTarget;
-                DebugGoal = currentGoal;
+                // Plan
+                if (mode == AIMode.Lane) PlanLane(currentGoal);
+                else PlanLocal(currentGoal);
 
                 if (logEachDecisionTick && logLevel >= LogLevel.Info)
                 {
-                    Log(LogLevel.Info, $"Tick: mode={mode}, distXZ={DebugFlatDistance:0.0}, target={V3(currentTarget)}, goal={V3(currentGoal)}, wpi={waypointIndex}/{cachedWaypoints.Count}, routeMode={routeMode}");
+                    Log(LogLevel.Info,
+                        $"Tick mode={mode}, target={V3(DebugTarget)}, goal={V3(DebugGoal)}, distXZ={DebugFlatDistance:0.0}, ok={DebugLastPlanOk}, msg={DebugLastPlanMessage}");
                 }
-
-                if (mode == AIMode.Lane) PlanLane(currentGoal);
-                else PlanLocal(currentGoal);
             }
+
+            // ★ Next-Gen（追加）：状況に応じて機体ハンドリングを一時的に変える
+            ApplyProfileHint();
 
             controller.Tick(Time.deltaTime);
             EnforceKeepOut();
         }
 
         // -----------------------
-        // Waypoints / Roam
+        // Goal selection & mode
+        // -----------------------
+        void SelectGoalAndMode()
+        {
+            // target selection
+            if (routeMode == RouteMode.RandomRoam)
+            {
+                if (ShouldSwitchGoalXZ(currentTarget))
+                {
+                    currentTarget = PickRandomRoamTarget();
+                    if (logGoalSelect) Log(LogLevel.Info, $"Roam target -> {V3(currentTarget)}");
+                }
+            }
+            else
+            {
+                if (cachedWaypoints.Count == 0)
+                {
+                    // fallback
+                    routeMode = RouteMode.RandomRoam;
+                    currentTarget = PickRandomRoamTarget();
+                    if (logGoalSelect) Log(LogLevel.Warn, "No waypoints found -> RandomRoam fallback");
+                }
+                else
+                {
+                    var wp = cachedWaypoints[waypointIndex];
+                    currentTarget = wp.position;
+
+                    if (ShouldSwitchGoalXZ(currentTarget))
+                    {
+                        AdvanceWaypoint();
+                        currentTarget = cachedWaypoints[waypointIndex].position;
+                        if (logGoalSelect) Log(LogLevel.Info, $"Waypoint -> idx={waypointIndex}/{cachedWaypoints.Count} pos={V3(currentTarget)}");
+                    }
+                }
+            }
+
+            // build goal (altitude policy)
+            currentGoal = BuildGoalFromTarget(currentTarget);
+
+            DebugTarget = currentTarget;
+            DebugGoal = currentGoal;
+
+            // mode selection by flat distance
+            float dx = currentGoal.x - transform.position.x;
+            float dz = currentGoal.z - transform.position.z;
+            DebugFlatDistance = Mathf.Sqrt(dx * dx + dz * dz);
+
+            AIMode newMode = mode;
+
+            if (DebugFlatDistance >= laneRange) newMode = AIMode.Lane;
+            else if (DebugFlatDistance <= terminalRange) newMode = AIMode.Terminal;
+
+            if (logModeChange && newMode != mode)
+                Log(LogLevel.Info, $"ModeChange {mode} -> {newMode} (distXZ={DebugFlatDistance:0.0})");
+
+            mode = newMode;
+        }
+
+        bool ShouldSwitchGoalXZ(Vector3 target)
+        {
+            if (Time.time - lastGoalSwitchTime < minSecondsBetweenGoalSwitch) return false;
+
+            float dx = target.x - transform.position.x;
+            float dz = target.z - transform.position.z;
+            float d = Mathf.Sqrt(dx * dx + dz * dz);
+            return d <= waypointReachDistXZ;
+        }
+
+        void EnsureInitialTarget()
+        {
+            if (routeMode == RouteMode.RandomRoam)
+            {
+                currentTarget = PickRandomRoamTarget();
+                currentGoal = BuildGoalFromTarget(currentTarget);
+                DebugTarget = currentTarget;
+                DebugGoal = currentGoal;
+                return;
+            }
+
+            if (cachedWaypoints.Count == 0)
+            {
+                routeMode = RouteMode.RandomRoam;
+                currentTarget = PickRandomRoamTarget();
+                currentGoal = BuildGoalFromTarget(currentTarget);
+                DebugTarget = currentTarget;
+                DebugGoal = currentGoal;
+                return;
+            }
+
+            waypointIndex = Mathf.Clamp(waypointIndex, 0, cachedWaypoints.Count - 1);
+            currentTarget = cachedWaypoints[waypointIndex].position;
+            currentGoal = BuildGoalFromTarget(currentTarget);
+            DebugTarget = currentTarget;
+            DebugGoal = currentGoal;
+        }
+
+        void AdvanceWaypoint()
+        {
+            lastGoalSwitchTime = Time.time;
+
+            if (shuffleWaypoints)
+            {
+                waypointIndex = Random.Range(0, cachedWaypoints.Count);
+                return;
+            }
+
+            waypointIndex++;
+            if (waypointIndex >= cachedWaypoints.Count)
+            {
+                if (loopWaypoints) waypointIndex = 0;
+                else waypointIndex = cachedWaypoints.Count - 1;
+            }
+        }
+
+        // -----------------------
+        // Waypoint cache
         // -----------------------
         void BuildWaypointCache()
         {
             cachedWaypoints.Clear();
 
-            // 1) explicit array
             if (waypoints != null && waypoints.Length > 0)
             {
                 for (int i = 0; i < waypoints.Length; i++)
                     if (waypoints[i] != null) cachedWaypoints.Add(waypoints[i]);
             }
 
-            // 2) root children
             if (cachedWaypoints.Count == 0 && waypointRoot != null)
             {
                 for (int i = 0; i < waypointRoot.childCount; i++)
@@ -305,7 +396,6 @@ if (revNow != lastDbRevision)
                 }
             }
 
-            // 3) RoutePath component in scene
             if (cachedWaypoints.Count == 0)
             {
                 var rp = FindFirstObjectByType<RoutePath>();
@@ -316,145 +406,35 @@ if (revNow != lastDbRevision)
                 }
             }
 
-            if (shuffleWaypoints && cachedWaypoints.Count > 1)
-                Shuffle(cachedWaypoints);
+            if (cachedWaypoints.Count == 0 && autoEstimateRoamBoundsFromColliders)
+            {
+                // no-op (bounds estimation happens in EnsureLaneGraph)
+            }
 
             if (cachedWaypoints.Count == 0 && routeMode == RouteMode.Waypoints)
-            {
-                Log(LogLevel.Warn, "No waypoints found -> switching routeMode to RandomRoam.");
-                routeMode = RouteMode.RandomRoam;
-            }
-
-            if (autoEstimateRoamBoundsFromColliders)
-                roamBounds = EstimateRoamBoundsFallback(roamBounds);
-
-            if (logGoalSelect && logLevel >= LogLevel.Info)
-            {
-                Log(LogLevel.Info, $"Waypoints cached: {cachedWaypoints.Count}, roamBounds={V3(roamBounds.center)} size={V3(roamBounds.size)}");
-            }
+                Log(LogLevel.Warn, "Waypoints empty. Will fallback to RandomRoam at runtime.");
         }
 
-        void EnsureInitialTarget()
+        // -----------------------
+        // Random roam
+        // -----------------------
+        Vector3 PickRandomRoamTarget()
         {
-            if (routeMode == RouteMode.Waypoints && cachedWaypoints.Count > 0)
-            {
-                waypointIndex = Mathf.Clamp(waypointIndex, 0, cachedWaypoints.Count - 1);
-                currentTarget = cachedWaypoints[waypointIndex].position;
-                lastGoalSwitchTime = Time.time;
-                return;
-            }
+            if (autoEstimateRoamBoundsFromColliders && cachedWorldBounds.size.sqrMagnitude > 1f)
+                roamBounds = cachedWorldBounds;
 
-            currentTarget = PickRoamTarget(transform.position);
+            Vector2 dir = Random.insideUnitCircle.normalized;
+            float seg = Random.Range(roamMinSegment, roamMaxSegment);
+
+            Vector3 p = transform.position + new Vector3(dir.x, 0f, dir.y) * seg;
+
+            Vector3 c = roamBounds.center;
+            Vector3 e = roamBounds.extents;
+            p.x = Mathf.Clamp(p.x, c.x - e.x, c.x + e.x);
+            p.z = Mathf.Clamp(p.z, c.z - e.z, c.z + e.z);
+
             lastGoalSwitchTime = Time.time;
-        }
-
-        void MaybeAdvanceTarget()
-        {
-            if (routeMode == RouteMode.Waypoints && cachedWaypoints.Count > 0)
-            {
-                Vector2 a = new Vector2(transform.position.x, transform.position.z);
-                Vector2 b = new Vector2(currentTarget.x, currentTarget.z);
-                float dist = Vector2.Distance(a, b);
-
-                bool close = dist <= waypointReachDistXZ;
-                bool timeOk = (Time.time - lastGoalSwitchTime) >= minSecondsBetweenGoalSwitch;
-
-                if (close && timeOk)
-                {
-                    int old = waypointIndex;
-                    waypointIndex++;
-
-                    if (waypointIndex >= cachedWaypoints.Count)
-                    {
-                        if (loopWaypoints) waypointIndex = 0;
-                        else waypointIndex = cachedWaypoints.Count - 1;
-                    }
-
-                    currentTarget = cachedWaypoints[waypointIndex].position;
-                    lastGoalSwitchTime = Time.time;
-
-                    if (logGoalSelect)
-                        Log(LogLevel.Info, $"TargetSwitch: waypoint {old} -> {waypointIndex}, target={V3(currentTarget)} (distXZ={dist:0.0})");
-                }
-                else
-                {
-                    var t = cachedWaypoints[Mathf.Clamp(waypointIndex, 0, cachedWaypoints.Count - 1)];
-                    if (t != null) currentTarget = t.position;
-                }
-
-                return;
-            }
-
-            {
-                Vector2 a = new Vector2(transform.position.x, transform.position.z);
-                Vector2 b = new Vector2(currentTarget.x, currentTarget.z);
-                float dist = Vector2.Distance(a, b);
-
-                bool close = dist <= waypointReachDistXZ;
-                bool timeOk = (Time.time - lastGoalSwitchTime) >= minSecondsBetweenGoalSwitch;
-
-                if (close && timeOk)
-                {
-                    Vector3 oldT = currentTarget;
-                    currentTarget = PickRoamTarget(transform.position);
-                    lastGoalSwitchTime = Time.time;
-
-                    if (logGoalSelect)
-                        Log(LogLevel.Info, $"TargetSwitch: roam {V3(oldT)} -> {V3(currentTarget)} (distXZ={dist:0.0})");
-                }
-            }
-        }
-
-        Vector3 PickRoamTarget(Vector3 from)
-        {
-            for (int i = 0; i < 24; i++)
-            {
-                float rx = Random.Range(roamBounds.min.x, roamBounds.max.x);
-                float rz = Random.Range(roamBounds.min.z, roamBounds.max.z);
-
-                Vector2 a = new Vector2(from.x, from.z);
-                Vector2 b = new Vector2(rx, rz);
-                float d = Vector2.Distance(a, b);
-
-                if (d < roamMinSegment) continue;
-                if (d > roamMaxSegment) continue;
-
-                return new Vector3(rx, from.y, rz);
-            }
-
-            float x = Random.Range(roamBounds.min.x, roamBounds.max.x);
-            float z = Random.Range(roamBounds.min.z, roamBounds.max.z);
-            return new Vector3(x, from.y, z);
-        }
-
-        static void Shuffle<T>(List<T> list)
-        {
-            for (int i = 0; i < list.Count; i++)
-            {
-                int j = Random.Range(i, list.Count);
-                (list[i], list[j]) = (list[j], list[i]);
-            }
-        }
-
-        Bounds EstimateRoamBoundsFallback(Bounds fallback)
-        {
-            var cols = FindObjectsByType<Collider>(FindObjectsSortMode.None);
-            bool init = false;
-            Bounds b = fallback;
-
-            foreach (var c in cols)
-            {
-                if (!c.enabled) continue;
-                if (!init) { b = c.bounds; init = true; }
-                else b.Encapsulate(c.bounds);
-            }
-
-            if (!init) return fallback;
-
-            b.Expand(new Vector3(800, 0, 800));
-            b.center = new Vector3(b.center.x, fallback.center.y, b.center.z);
-            b.size = new Vector3(b.size.x, fallback.size.y, b.size.z);
-            return b;
+            return p;
         }
 
         // -----------------------
@@ -634,6 +614,35 @@ if (revNow != lastDbRevision)
                 if (d < bestD) { best = i; bestD = d; }
             }
             return best;
+        }
+
+        // -----------------------
+        // Next-Gen（追加）：Profile hinting
+        // -----------------------
+        void ApplyProfileHint()
+        {
+            // FlightController が次世代版（SetProfileあり）の場合だけ効く
+            // ※古いFlightControllerでもコンパイルは通るように、SetProfileは必ず実装して下さい（下に全文あり）
+            if (controller == null) return;
+
+            // KeepOut内は抜けるのを最優先（Evadeを短くホールド）
+            var db = volumeCollector.database;
+            db.EvaluatePoint(transform.position, agentRadius, out var flags, out _);
+            if ((flags & NavFlags.KeepOut) != 0)
+            {
+                controller.SetProfile(FlightController.FlightProfile.Evade, 0.25f);
+                return;
+            }
+
+            // 近距離（Terminal）＝格闘レンジ想定でキビキビ
+            if (mode == AIMode.Terminal)
+            {
+                controller.SetProfile(FlightController.FlightProfile.EngageMelee, 0.20f);
+                return;
+            }
+
+            // 通常巡航
+            controller.SetProfile(FlightController.FlightProfile.Cruise);
         }
 
         // -----------------------

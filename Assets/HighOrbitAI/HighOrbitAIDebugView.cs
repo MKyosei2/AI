@@ -103,9 +103,9 @@ namespace HighOrbitAI
             string modeStr = ai.CurrentMode.ToString();
             string koStr = ai.DebugInKeepOut ? "KeepOut" : "-";
 
-            // ★ 文字列補間のネストを避ける：CS1039/CS1010系（未終了文字列/改行）を確実に回避
             label.text =
                 "[" + modeStr + "] " + okStr + "  " + koStr + "\n" +
+                "Profile:" + controller.CurrentProfile + " -> " + controller.TargetProfile + "\n" +   // ★追加
                 "DistXZ:" + ai.DebugFlatDistance.ToString("0.0") + "\n" +
                 "Alt:" + ai.DebugDesiredY.ToString("0.0") + "/" + ai.DebugCeilingY.ToString("0.0") + "\n" +
                 "WP:" + ai.DebugWaypointIndex + "/" + ai.DebugWaypointCount + "\n" +
