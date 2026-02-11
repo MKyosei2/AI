@@ -6,7 +6,7 @@ namespace HighOrbitAI
     {
         public enum AltitudeBand { Low, Mid, High }
         public enum Tactic { None, CruisePatrol, EngageMelee, StrafeOrbit, CoverApproach, ClimbReset, DiveAttack }
-        public enum Phase { None, DiveSetup, DiveCommit, EngageMelee, EscapeReset, OrbitShoot, CoverApproach }
+        public enum Phase { None, DiveSetup, DiveCommit, EngageMelee, EscapeReset, OrbitShoot, CoverApproach, FlankSetup }
 
         public struct Result
         {
@@ -33,8 +33,8 @@ namespace HighOrbitAI
         public float obstacleDensityToReset = 0.55f;
 
         [Header("Threat bias")]
-        [Range(0f, 1f)] public float underFireToReset = 0.55f;   // これ以上なら逃げ/上へ
-        [Range(0f, 1f)] public float targetedToHigh = 0.45f;     // これ以上なら高高度寄り
+        [Range(0f, 1f)] public float underFireToReset = 0.55f;
+        [Range(0f, 1f)] public float targetedToHigh = 0.45f;
 
         [Header("Cover Approach")]
         public float coverLateralOffset = 60f;
@@ -45,6 +45,21 @@ namespace HighOrbitAI
         public float diveSetupDist = 220f;
         public float diveCommitDist = 160f;
         public float diveBoostHold = 0.35f;
+
+        [Header("Interceptor Flank")]
+        public float flankBehindDist = 85f;
+        public float flankLateralDist = 60f;
+        public float flankHold = 0.9f;
+
+        [Header("Gunner")]
+        public float gunnerAvoidMeleeDist = 55f;
+        public float gunnerPreferHigh = 0.8f;
+
+        [Header("Support")]
+        public float supportPreferredMin = 90f;
+        public float supportPreferredMax = 160f;
+        public float supportOrbitRadius = 75f;
+        public float supportEscapeBias = 0.75f;
 
         [Header("Phase Timing (seconds)")]
         public float phaseMinHold = 0.45f;
@@ -86,6 +101,7 @@ namespace HighOrbitAI
             ICombatStateProvider combatState,
             float underFire01,
             float targeted01,
+            SquadRole role,
             float nowTime)
         {
             var r = new Result
@@ -132,40 +148,68 @@ namespace HighOrbitAI
             bool inShootRange = dist <= shootingRange;
             bool hasLOS = HasLineOfSight(selfPos, enemyPos, db, agentRadius);
 
-            // ---- フェーズロック中はやり切る
-            if (PhaseLocked(nowTime))
-                return BuildByPhase(phase, selfPos, selfForward, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, nowTime);
+            float enemyThreat = 0f;
+            float enemyWeapon = 0f, enemyHp = 1f, enemyLock = 0f;
+            var ti = enemy.GetComponent<IThreatInfoProvider>();
+            if (ti != null)
+            {
+                enemyWeapon = Mathf.Clamp01(ti.WeaponThreat01);
+                enemyHp = Mathf.Clamp01(ti.Hp01);
+                enemyLock = Mathf.Clamp01(ti.LockOnThreat01);
+                enemyThreat = Mathf.Clamp01(enemyWeapon * 0.55f + enemyHp * 0.20f + enemyLock * 0.65f);
+            }
 
-            // ---- 不利が強い：上へ逃げて仕切り直し
-            if (underFire01 >= underFireToReset && dist >= resetMinDist)
+            float dangerSelf = Mathf.Clamp01(Mathf.Max(underFire01, targeted01));
+            bool preferHigh = targeted01 >= targetedToHigh;
+
+            float escapeBias = (role == SquadRole.Support) ? supportEscapeBias : 1f;
+            float underFireResetTh = underFireToReset * Mathf.Lerp(1f, 0.85f, (role == SquadRole.Support || role == SquadRole.Gunner) ? 1f : 0f);
+
+            if (PhaseLocked(nowTime))
+                return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
+
+            if (dangerSelf >= underFireResetTh * escapeBias && dist >= resetMinDist)
             {
                 SetPhase(Phase.EscapeReset, nowTime, escapeHold);
-                return BuildByPhase(phase, selfPos, selfForward, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, nowTime);
+                return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
             }
 
-            // ---- 近接へ
-            if (dist <= meleeRange || melee)
+            if (role == SquadRole.Interceptor)
             {
-                SetPhase(Phase.EngageMelee, nowTime, meleeHold);
-                return BuildByPhase(phase, selfPos, selfForward, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, nowTime);
+                if (dist > meleeRange && dist < diveSetupDist && TryBuildFlankPoint(selfPos, enemy, enemyPos, db, agentRadius, out _))
+                {
+                    SetPhase(Phase.FlankSetup, nowTime, flankHold);
+                    return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
+                }
+
+                if (dist <= meleeRange || melee)
+                {
+                    SetPhase(Phase.EngageMelee, nowTime, meleeHold);
+                    return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
+                }
+            }
+            else
+            {
+                if (dist <= gunnerAvoidMeleeDist)
+                {
+                    SetPhase(Phase.EscapeReset, nowTime, escapeHold);
+                    return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
+                }
             }
 
-            // ---- 障害密度が高い：上へ
             float density = EstimateObstacleDensityXZ(selfPos, enemyPos, db, agentRadius);
             if (density >= obstacleDensityToReset && dist >= resetMinDist)
             {
                 SetPhase(Phase.EscapeReset, nowTime, escapeHold);
-                return BuildByPhase(phase, selfPos, selfForward, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, nowTime);
+                return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
             }
 
-            // ---- 遠距離：Diveセットアップ
-            if (dist >= diveSetupDist)
+            if (dist >= diveSetupDist && role == SquadRole.Interceptor)
             {
                 SetPhase(Phase.DiveSetup, nowTime, diveSetupHold);
-                return BuildByPhase(phase, selfPos, selfForward, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, nowTime);
+                return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
             }
 
-            // ---- 射撃圏：LOSあり→周回、LOSなし→遮蔽接近
             if (inShootRange)
             {
                 if (hasLOS)
@@ -175,23 +219,30 @@ namespace HighOrbitAI
                         : lockedOrbitSide.normalized;
 
                     SetPhase(Phase.OrbitShoot, nowTime, orbitHold);
-                    return BuildByPhase(phase, selfPos, selfForward, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, nowTime);
+                    return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
                 }
                 else
                 {
                     SetPhase(Phase.CoverApproach, nowTime, coverHold);
-                    return BuildByPhase(phase, selfPos, selfForward, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, nowTime);
+                    return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
                 }
             }
 
+            if (role == SquadRole.Support)
+            {
+                SetPhase(Phase.OrbitShoot, nowTime, orbitHold);
+                return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
+            }
+
             SetPhase(Phase.CoverApproach, nowTime, coverHold);
-            return BuildByPhase(phase, selfPos, selfForward, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, nowTime);
+            return BuildByPhase(phase, selfPos, selfForward, enemy, enemyPos, dir, dist, db, agentRadius, hasLOS, underFire01, targeted01, role, enemyThreat, nowTime);
         }
 
         Result BuildByPhase(
             Phase ph,
             Vector3 selfPos,
             Vector3 selfForward,
+            Transform enemy,
             Vector3 enemyPos,
             Vector3 dirToEnemy,
             float dist,
@@ -200,6 +251,8 @@ namespace HighOrbitAI
             bool hasLOS,
             float underFire01,
             float targeted01,
+            SquadRole role,
+            float enemyThreat01,
             float nowTime)
         {
             var r = new Result
@@ -213,11 +266,38 @@ namespace HighOrbitAI
                 profileHold = 0.18f
             };
 
-            // targeted が強いときは “上空”へ寄せる（障害少＝回避しやすい世界観）
             bool preferHigh = targeted01 >= targetedToHigh;
+            float dangerSelf = Mathf.Clamp01(Mathf.Max(underFire01, targeted01));
+
+            if (role == SquadRole.Gunner) preferHigh = true;
+            if (role == SquadRole.Support && dangerSelf > 0.25f) preferHigh = true;
 
             switch (ph)
             {
+                case Phase.FlankSetup:
+                    r.tactic = Tactic.CoverApproach;
+                    r.band = AltitudeBand.Mid;
+                    r.profile = FlightController.FlightProfile.Cruise;
+                    r.profileHold = 0.18f;
+
+                    if (TryBuildFlankPoint(selfPos, enemy, enemyPos, db, agentRadius, out var flankPoint))
+                        r.targetPos = flankPoint;
+                    else
+                        r.targetPos = enemyPos;
+
+                    {
+                        float dx = r.targetPos.x - selfPos.x;
+                        float dz = r.targetPos.z - selfPos.z;
+                        float dXZ = Mathf.Sqrt(dx * dx + dz * dz);
+                        if (dXZ <= 35f)
+                            SetPhase(Phase.DiveCommit, nowTime, diveCommitHold);
+                    }
+
+                    if (dist <= meleeRange)
+                        SetPhase(Phase.EngageMelee, nowTime, meleeHold);
+
+                    return r;
+
                 case Phase.DiveSetup:
                     r.tactic = Tactic.DiveAttack;
                     r.band = AltitudeBand.High;
@@ -232,13 +312,16 @@ namespace HighOrbitAI
 
                 case Phase.DiveCommit:
                     r.tactic = Tactic.DiveAttack;
-                    r.band = preferHigh ? AltitudeBand.Mid : AltitudeBand.Mid;
+                    r.band = AltitudeBand.Mid;
                     r.targetPos = enemyPos;
                     r.profile = FlightController.FlightProfile.Boost;
                     r.profileHold = diveBoostHold;
 
-                    if (dist <= meleeRange)
+                    if (dist <= meleeRange && role == SquadRole.Interceptor)
                         SetPhase(Phase.EngageMelee, nowTime, meleeHold);
+
+                    if (role != SquadRole.Interceptor && dist <= gunnerAvoidMeleeDist)
+                        SetPhase(Phase.EscapeReset, nowTime, escapeHold);
 
                     return r;
 
@@ -249,9 +332,7 @@ namespace HighOrbitAI
                     r.profile = FlightController.FlightProfile.EngageMelee;
                     r.profileHold = 0.22f;
 
-                    if (underFire01 >= underFireToReset)
-                        SetPhase(Phase.EscapeReset, nowTime, escapeHold);
-                    else if (dist >= meleeExitRange)
+                    if (dangerSelf >= underFireToReset || dist >= meleeExitRange)
                         SetPhase(Phase.EscapeReset, nowTime, escapeHold);
 
                     return r;
@@ -263,14 +344,24 @@ namespace HighOrbitAI
                     r.profile = FlightController.FlightProfile.Evade;
                     r.profileHold = 0.25f;
 
-                    if (dist >= diveSetupDist * 0.85f)
+                    if (role == SquadRole.Interceptor && dist >= diveSetupDist * 0.85f)
                         SetPhase(Phase.DiveSetup, nowTime, diveSetupHold);
+
+                    if (role != SquadRole.Interceptor && dist >= shootingRange * 0.9f)
+                        SetPhase(Phase.OrbitShoot, nowTime, orbitHold);
 
                     return r;
 
                 case Phase.OrbitShoot:
                     r.tactic = Tactic.StrafeOrbit;
-                    r.band = preferHigh ? AltitudeBand.High : AltitudeBand.Mid;
+
+                    if (role == SquadRole.Gunner) r.band = AltitudeBand.High;
+                    else if (role == SquadRole.Support) r.band = preferHigh ? AltitudeBand.High : AltitudeBand.Mid;
+                    else r.band = preferHigh ? AltitudeBand.High : AltitudeBand.Mid;
+
+                    float rad = orbitRadius;
+                    if (role == SquadRole.Support) rad = supportOrbitRadius;
+
                     r.profile = FlightController.FlightProfile.Shooting;
                     r.profileHold = 0.20f;
 
@@ -281,69 +372,178 @@ namespace HighOrbitAI
 
                         float ang = (nowTime - lastPhaseSetTime) * orbitAngularDegPerSec * Mathf.Deg2Rad;
                         Vector3 forwardOnPlane = Vector3.Cross(dirToEnemy, right).normalized;
-                        Vector3 orbitOffset = (Mathf.Cos(ang) * right + Mathf.Sin(ang) * forwardOnPlane).normalized * orbitRadius;
+                        Vector3 orbitOffset = (Mathf.Cos(ang) * right + Mathf.Sin(ang) * forwardOnPlane).normalized * rad;
                         r.targetPos = enemyPos + orbitOffset;
+                    }
+
+                    if (role == SquadRole.Support)
+                    {
+                        if (dist < supportPreferredMin)
+                        {
+                            r.extraSteer += (-dirToEnemy) * 0.6f;
+                            r.profile = FlightController.FlightProfile.Evade;
+                            r.profileHold = 0.18f;
+                        }
+                        else if (dist > supportPreferredMax)
+                        {
+                            r.extraSteer += (dirToEnemy) * 0.35f;
+                        }
                     }
 
                     if (!hasLOS)
                         SetPhase(Phase.CoverApproach, nowTime, coverHold);
 
-                    if (underFire01 >= underFireToReset)
+                    float threatEscape = Mathf.Lerp(underFireToReset, underFireToReset * 0.85f, enemyThreat01);
+                    if ((role == SquadRole.Gunner || role == SquadRole.Support) && dangerSelf >= threatEscape)
                         SetPhase(Phase.EscapeReset, nowTime, escapeHold);
 
-                    if (dist <= meleeRange)
+                    if (role == SquadRole.Interceptor && dist <= meleeRange)
                         SetPhase(Phase.EngageMelee, nowTime, meleeHold);
+
+                    if (role != SquadRole.Interceptor && dist <= gunnerAvoidMeleeDist)
+                        SetPhase(Phase.EscapeReset, nowTime, escapeHold);
 
                     return r;
 
                 case Phase.CoverApproach:
                 default:
                     r.tactic = Tactic.CoverApproach;
-                    r.band = preferHigh ? AltitudeBand.Mid : (hasLOS ? AltitudeBand.Mid : AltitudeBand.Low);
 
-                    if (!hasLOS && db != null)
+                    if (role == SquadRole.Interceptor)
                     {
-                        Vector3 lateral = Vector3.Cross(Vector3.up, dirToEnemy).normalized;
-                        if (TryFindSideApproach(selfPos, enemyPos, lateral, db, agentRadius, out var best) ||
-                            TryFindSideApproach(selfPos, enemyPos, -lateral, db, agentRadius, out best))
-                            r.targetPos = best;
+                        if (TryBuildFlankPoint(selfPos, enemy, enemyPos, db, agentRadius, out var flankPoint2))
+                            r.targetPos = flankPoint2;
                         else
                             r.targetPos = enemyPos;
-                    }
-                    else
-                    {
-                        r.targetPos = enemyPos;
-                    }
 
-                    if (dist <= shootingRange && hasLOS)
-                    {
-                        r.profile = FlightController.FlightProfile.Shooting;
-                        r.profileHold = 0.18f;
-                    }
-                    else
-                    {
+                        r.band = AltitudeBand.Mid;
                         r.profile = FlightController.FlightProfile.Cruise;
-                        r.profileHold = 0.15f;
+                        r.profileHold = 0.16f;
+
+                        if (dist <= diveCommitDist)
+                            SetPhase(Phase.DiveCommit, nowTime, diveCommitHold);
+
+                        return r;
                     }
 
-                    if (underFire01 >= underFireToReset)
-                        SetPhase(Phase.EscapeReset, nowTime, escapeHold);
+                    if (role == SquadRole.Gunner)
+                    {
+                        r.band = AltitudeBand.High;
+                        r.profile = hasLOS ? FlightController.FlightProfile.Shooting : FlightController.FlightProfile.Cruise;
+                        r.profileHold = 0.16f;
 
-                    if (dist <= meleeRange)
-                        SetPhase(Phase.EngageMelee, nowTime, meleeHold);
+                        if (dist <= gunnerAvoidMeleeDist)
+                            SetPhase(Phase.EscapeReset, nowTime, escapeHold);
 
+                        if (hasLOS)
+                            SetPhase(Phase.OrbitShoot, nowTime, orbitHold);
+
+                        if (!hasLOS && db != null)
+                        {
+                            Vector3 lateral = Vector3.Cross(Vector3.up, dirToEnemy).normalized;
+                            if (TryFindSideApproach(selfPos, enemyPos, lateral, db, agentRadius, out var best) ||
+                                TryFindSideApproach(selfPos, enemyPos, -lateral, db, agentRadius, out best))
+                                r.targetPos = best;
+                        }
+
+                        return r;
+                    }
+
+                    if (role == SquadRole.Support)
+                    {
+                        r.band = preferHigh ? AltitudeBand.High : AltitudeBand.Mid;
+                        r.profile = hasLOS ? FlightController.FlightProfile.Shooting : FlightController.FlightProfile.Cruise;
+                        r.profileHold = 0.16f;
+
+                        if (dist < supportPreferredMin)
+                        {
+                            r.extraSteer += (-dirToEnemy) * 0.7f;
+                            r.profile = FlightController.FlightProfile.Evade;
+                            r.profileHold = 0.18f;
+                        }
+                        else if (dist > supportPreferredMax)
+                        {
+                            r.extraSteer += (dirToEnemy) * 0.4f;
+                        }
+
+                        if (!hasLOS && db != null)
+                        {
+                            Vector3 lateral = Vector3.Cross(Vector3.up, dirToEnemy).normalized;
+                            if (TryFindSideApproach(selfPos, enemyPos, lateral, db, agentRadius, out var best) ||
+                                TryFindSideApproach(selfPos, enemyPos, -lateral, db, agentRadius, out best))
+                                r.targetPos = best;
+                        }
+
+                        if (dangerSelf >= underFireToReset * supportEscapeBias)
+                            SetPhase(Phase.EscapeReset, nowTime, escapeHold);
+
+                        if (hasLOS)
+                            SetPhase(Phase.OrbitShoot, nowTime, orbitHold);
+
+                        return r;
+                    }
+
+                    r.band = hasLOS ? AltitudeBand.Mid : AltitudeBand.Low;
+                    r.targetPos = enemyPos;
+                    r.profile = (dist <= shootingRange && hasLOS) ? FlightController.FlightProfile.Shooting : FlightController.FlightProfile.Cruise;
+                    r.profileHold = 0.15f;
                     return r;
             }
+        }
+
+        bool TryBuildFlankPoint(Vector3 selfPos, Transform enemy, Vector3 enemyPos, VolumeDatabase db, float agentRadius, out Vector3 flankPos)
+        {
+            flankPos = enemyPos;
+            if (enemy == null) return false;
+
+            Vector3 enemyFwd = enemy.forward;
+            Vector3 enemyRight = enemy.right;
+
+            Vector3 behind = enemyPos - enemyFwd.normalized * flankBehindDist;
+
+            Vector3 toSelf = (selfPos - enemyPos);
+            float side = Mathf.Sign(Vector3.Dot(toSelf, enemyRight));
+            if (Mathf.Abs(side) < 0.01f) side = 1f;
+
+            Vector3 lateral = enemyRight.normalized * (flankLateralDist * side);
+
+            Vector3 c1 = behind + lateral;
+            Vector3 c2 = behind - lateral;
+
+            if (IsPointOk(selfPos, c1, enemyPos, db, agentRadius))
+            {
+                flankPos = c1;
+                return true;
+            }
+            if (IsPointOk(selfPos, c2, enemyPos, db, agentRadius))
+            {
+                flankPos = c2;
+                return true;
+            }
+
+            return false;
+        }
+
+        bool IsPointOk(Vector3 selfPos, Vector3 candidate, Vector3 enemyPos, VolumeDatabase db, float agentRadius)
+        {
+            if (db == null) return true;
+
+            if (db.SegmentHitsHardAny(selfPos, candidate)) return false;
+            if (db.SegmentHitsHardAny(candidate, enemyPos)) return false;
+
+            if (!useThicknessSampling) return true;
+
+            if (!HasLineOfSight(selfPos, candidate, db, agentRadius)) return false;
+            if (!HasLineOfSight(candidate, enemyPos, db, agentRadius)) return false;
+
+            return true;
         }
 
         bool HasLineOfSight(Vector3 a, Vector3 b, VolumeDatabase db, float agentRadius)
         {
             if (db == null) return true;
 
-            // まずはDBの高速判定（引数2つの実装に合わせる）
             if (db.SegmentHitsHardAny(a, b)) return false;
-
-            // 太さ（半径）を見たければ軽くサンプリング補助
             if (!useThicknessSampling) return true;
 
             Vector3 ab = b - a;
@@ -408,22 +608,18 @@ namespace HighOrbitAI
                 float offset = Mathf.Lerp(coverLateralOffset, coverMaxOffset, k);
                 Vector3 candidate = enemyPos + lateralDir * offset;
 
-                // ここも高速判定
                 bool ok1 = !db.SegmentHitsHardAny(selfPos, candidate);
                 bool ok2 = !db.SegmentHitsHardAny(candidate, enemyPos);
+                if (!ok1 || !ok2) continue;
 
-                if (ok1 && ok2)
+                if (useThicknessSampling)
                 {
-                    // 厚みも見るなら補助
-                    if (useThicknessSampling)
-                    {
-                        if (!HasLineOfSight(selfPos, candidate, db, agentRadius)) continue;
-                        if (!HasLineOfSight(candidate, enemyPos, db, agentRadius)) continue;
-                    }
-
-                    outPos = candidate;
-                    return true;
+                    if (!HasLineOfSight(selfPos, candidate, db, agentRadius)) continue;
+                    if (!HasLineOfSight(candidate, enemyPos, db, agentRadius)) continue;
                 }
+
+                outPos = candidate;
+                return true;
             }
 
             return false;

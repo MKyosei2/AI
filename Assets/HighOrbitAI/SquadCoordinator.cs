@@ -96,5 +96,38 @@ namespace HighOrbitAI
             }
             return count;
         }
+
+        /// <summary>
+        /// squad内で「指定役割が主に狙っているターゲット」を返す（最新更新のものを採用）
+        /// </summary>
+        public static bool TryGetPrimaryTargetForRole(string squadId, SquadRole role, out Transform target, float staleSeconds = DefaultStaleSeconds)
+        {
+            target = null;
+
+            if (string.IsNullOrEmpty(squadId)) squadId = "_default";
+            if (!squads.TryGetValue(squadId, out var map)) return false;
+
+            float now = Time.time;
+            float bestT = -999999f;
+            Transform best = null;
+
+            foreach (var kv in map)
+            {
+                var s = kv.Value;
+                if (s.role != role) continue;
+                if ((now - s.lastUpdateTime) > staleSeconds) continue;
+                if (s.currentTarget == null) continue;
+
+                if (s.lastUpdateTime > bestT)
+                {
+                    bestT = s.lastUpdateTime;
+                    best = s.currentTarget;
+                }
+            }
+
+            if (best == null) return false;
+            target = best;
+            return true;
+        }
     }
 }

@@ -11,6 +11,13 @@ namespace HighOrbitAI
         public float agentRadius = 0.8f;
         public float dynamicCellSize = 10f;
 
+        [Header("Perf")]
+        [Tooltip("動的Volumeの更新を行うか")]
+        public bool enableDynamicUpdates = true;
+
+        [Tooltip("動的Volumeの更新頻度(Hz)。5〜10推奨。0なら毎フレーム更新。")]
+        public float dynamicUpdateHz = 5f;
+
         public VolumeDatabase database;
 
         readonly List<DynamicEntry> dynamicEntries = new List<DynamicEntry>(256);
@@ -23,6 +30,8 @@ namespace HighOrbitAI
             public SoftAvoidZone softAvoid;
             public ConditionalVolume conditional;
         }
+
+        float dynTimer;
 
         void Awake()
         {
@@ -41,6 +50,72 @@ namespace HighOrbitAI
             CollectConditionalVolumes();
 
             database.BuildStaticBVH();
+
+            // 動的が無いならハッシュも不要（ここが地味に効く）
+            if (dynamicEntries.Count > 0)
+                database.RebuildDynamicHash();
+        }
+
+        /// <summary>
+        /// 超軽量：動的更新はここを呼ぶ（間引き込み）
+        /// </summary>
+        public void TickDynamic(float dt)
+        {
+            if (!enableDynamicUpdates) return;
+            if (dynamicEntries.Count == 0) return;
+
+            if (dynamicUpdateHz <= 0f)
+            {
+                UpdateDynamicVolumesImmediate();
+                return;
+            }
+
+            dynTimer += dt;
+            float interval = 1f / Mathf.Max(0.1f, dynamicUpdateHz);
+            if (dynTimer < interval) return;
+
+            dynTimer = 0f;
+            UpdateDynamicVolumesImmediate();
+        }
+
+        // 互換用：従来どおり呼ばれても動く（＝即時更新）
+        public void UpdateDynamicVolumes()
+        {
+            if (dynamicEntries.Count == 0) return;
+            UpdateDynamicVolumesImmediate();
+        }
+
+        void UpdateDynamicVolumesImmediate()
+        {
+            for (int i = 0; i < dynamicEntries.Count; i++)
+            {
+                var e = dynamicEntries[i];
+
+                if (e.collider != null)
+                {
+                    database.UpdateDynamicBounds(e.volumeId, e.collider.bounds);
+                    continue;
+                }
+                if (e.keepOut != null)
+                {
+                    database.UpdateDynamicBounds(e.volumeId, e.keepOut.GetInflatedBounds(agentRadius));
+                    continue;
+                }
+                if (e.softAvoid != null)
+                {
+                    database.UpdateDynamicBounds(e.volumeId, e.softAvoid.GetInflatedBounds(agentRadius));
+                    continue;
+                }
+                if (e.conditional != null)
+                {
+                    e.conditional.GetCurrent(agentRadius, out Bounds b, out NavFlags flags, out float costAdd);
+                    flags |= NavFlags.Dynamic;
+                    database.UpdateDynamicAll(e.volumeId, b, flags, costAdd);
+                    continue;
+                }
+            }
+
+            // ★ここが重いので「動的がある時だけ」「間引き済み」で呼ぶ
             database.RebuildDynamicHash();
         }
 
@@ -59,7 +134,6 @@ namespace HighOrbitAI
 
                 if (!isDyn && !isSta) continue;
 
-                // Zones/Conditional は別経路で収集する（重複登録を避ける）
                 if (go.GetComponent<KeepOutZone>() != null) continue;
                 if (go.GetComponent<SoftAvoidZone>() != null) continue;
                 if (go.GetComponent<ConditionalVolume>() != null) continue;
@@ -113,10 +187,6 @@ namespace HighOrbitAI
             }
         }
 
-        /// <summary>
-        /// 条件付きVolume（ドア/液体/イベント）を収集する。
-        /// ここで登録されたものは “動的” として扱い、UpdateDynamicVolumesで状態更新される。
-        /// </summary>
         void CollectConditionalVolumes()
         {
             var cvs = FindObjectsByType<ConditionalVolume>(FindObjectsSortMode.None);
@@ -124,7 +194,6 @@ namespace HighOrbitAI
             {
                 cv.GetCurrent(agentRadius, out Bounds b, out NavFlags flags, out float costAdd);
 
-                // 条件付きは常にDynamicとして扱う（状態が変わるため）
                 flags |= NavFlags.Dynamic;
 
                 int id = database.AddVolume(new VolumeLite(b, flags, costAdd));
@@ -132,38 +201,6 @@ namespace HighOrbitAI
 
                 dynamicEntries.Add(new DynamicEntry { volumeId = id, conditional = cv });
             }
-        }
-
-        public void UpdateDynamicVolumes()
-        {
-            for (int i = 0; i < dynamicEntries.Count; i++)
-            {
-                var e = dynamicEntries[i];
-
-                if (e.collider != null)
-                {
-                    database.UpdateDynamicBounds(e.volumeId, e.collider.bounds);
-                    continue;
-                }
-                if (e.keepOut != null)
-                {
-                    database.UpdateDynamicBounds(e.volumeId, e.keepOut.GetInflatedBounds(agentRadius));
-                    continue;
-                }
-                if (e.softAvoid != null)
-                {
-                    database.UpdateDynamicBounds(e.volumeId, e.softAvoid.GetInflatedBounds(agentRadius));
-                    continue;
-                }
-                if (e.conditional != null)
-                {
-                    e.conditional.GetCurrent(agentRadius, out Bounds b, out NavFlags flags, out float costAdd);
-                    flags |= NavFlags.Dynamic;
-                    database.UpdateDynamicAll(e.volumeId, b, flags, costAdd);
-                    continue;
-                }
-            }
-            database.RebuildDynamicHash();
         }
     }
 }

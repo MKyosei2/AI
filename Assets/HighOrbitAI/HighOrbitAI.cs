@@ -7,11 +7,12 @@ namespace HighOrbitAI
     {
         public enum LogLevel { Off = 0, Error = 1, Warn = 2, Info = 3, Verbose = 4 }
 
-        [Header("Logging")]
+        [Header("Logging (Perf tip: turn off in stress test)")]
         public bool logEnabled = true;
         public LogLevel logLevel = LogLevel.Info;
         public float logThrottleSeconds = 0.15f;
-        public bool logEachDecisionTick = true;
+        public bool logEachDecisionTick = false;
+        public bool logModeChange = false;
 
         float lastLogTime = -999f;
         void Log(LogLevel lvl, string msg)
@@ -24,47 +25,26 @@ namespace HighOrbitAI
                 return;
 
             lastLogTime = now;
-            string prefix = $"[AI:{name}] ";
-
+            string prefix = $"[HighOrbitAI:{name}] ";
             if (lvl == LogLevel.Error) Debug.LogError(prefix + msg);
             else if (lvl == LogLevel.Warn) Debug.LogWarning(prefix + msg);
             else Debug.Log(prefix + msg);
         }
 
-        static float PathLength(IReadOnlyList<Vector3> pts)
-        {
-            if (pts == null || pts.Count < 2) return 0f;
-            float sum = 0f;
-            for (int i = 1; i < pts.Count; i++) sum += Vector3.Distance(pts[i - 1], pts[i]);
-            return sum;
-        }
-
+        // -----------------------
+        // Refs
+        // -----------------------
         [Header("Refs")]
         public VolumeCollector volumeCollector;
         public FlightController controller;
 
-        [Header("Combat (Optional)")]
-        public Transform combatTarget;
-        public MonoBehaviour combatStateProvider;
-        ICombatStateProvider combat;
-
-        [Header("Threat (Optional)")]
-        public MonoBehaviour threatSignalProvider;
-        IThreatSignalProvider threat;
-
-        [Header("Squad (Next-Gen)")]
-        public string squadId = "alpha";
-        public SquadRole squadRole = SquadRole.Interceptor;
-
-        [Header("Targeting (Next-Gen)")]
-        public bool autoAcquireTarget = true;
-        public MonoBehaviour targetProvider;
-        ITargetProvider targeter;
-
+        // -----------------------
+        // Route / Goal Source
+        // -----------------------
         public enum RouteMode { Waypoints, RandomRoam }
-        [Header("Route Source (Non-Combat)")]
-        public RouteMode routeMode = RouteMode.Waypoints;
 
+        [Header("Route Source")]
+        public RouteMode routeMode = RouteMode.Waypoints;
         public Transform[] waypoints;
         public Transform waypointRoot;
 
@@ -80,10 +60,24 @@ namespace HighOrbitAI
         public float roamMinSegment = 220f;
         public float roamMaxSegment = 520f;
 
-        [Header("Decision")]
-        public float decisionHz = 20f;
+        // -----------------------
+        // Update rates
+        // -----------------------
+        [Header("Decision (think rate)")]
+        public float decisionHz = 10f;
 
-        [Header("Altitude Policy (Base)")]
+        [Header("Planning (heavy)")]
+        public float planHz = 4f;
+        public float replanGoalDeltaXZ = 12f;
+
+        [Header("Smoothing / Anti-stutter")]
+        public bool staggerHeavyWork = true;
+        public float pathChangeEpsilon = 1.5f;
+
+        // -----------------------
+        // Altitude policy
+        // -----------------------
+        [Header("Altitude Policy")]
         public float lowHeight = 10f;
         public float ceilingAboveGround = 35f;
         public float minAboveGround = 3f;
@@ -92,16 +86,28 @@ namespace HighOrbitAI
         public float groundCastHeight = 1200f;
         public float groundMaxDistance = 2500f;
 
-        [Header("Route Planning")]
-        public float agentRadius = 0.8f;
-        public float laneRange = 260f;
+        // -----------------------
+        // 3D Cruise Graph (Sparse)
+        // -----------------------
+        [Header("3D Cruise Graph (Sparse, Ultra-light)")]
+        public float cruiseNodeSpacingXZ = 28f;
+        public float cruiseLayerSpacingY = 25f;
+        public float cruiseMinY = 10f;
+        public float cruiseMaxY = 320f;
+        public float cruiseEdgeMaxDistance = 95f;
+        public int cruiseSoftSamples = 2;
+
+        [Tooltip("低高度を嫌う係数。0で無効。")]
+        public float cruiseLowAltPenalty = 0.0015f;
+
+        [Tooltip("この高さ未満にいるほどペナルティ(上へ行きやすくなる)")]
+        public float cruisePenaltyBaseY = 70f;
+
+        // -----------------------
+        // Terminal Local 3D Grid
+        // -----------------------
+        [Header("Terminal 3D Grid (Refine)")]
         public float terminalRange = 160f;
-
-        [Header("Lane Graph")]
-        public float laneNodeSpacing = 35f;
-        public float laneEdgeMaxDist = 120f;
-
-        [Header("Local Grid")]
         public float localCellSize = 6f;
         public float localRadius = 140f;
 
@@ -109,16 +115,11 @@ namespace HighOrbitAI
         public float tieEpsilon = 0.02f;
         public float varietyPeriod = 2.0f;
 
-        [Header("Tactics (Next-Gen)")]
-        public bool enableTactics = true;
-        public float tacticsActivateDistXZ = 600f;
-
-        public float bandLowAdd = 0f;
-        public float bandMidAdd = 25f;
-        public float bandHighAdd = 80f;
-
-        TacticalDirector tactics = new TacticalDirector();
-
+        // -----------------------
+        // DebugView compatibility (IMPORTANT)
+        // DebugView は AIMode.Lane / AIMode.Terminal を期待している
+        // ここでは Lane = Cruise3D(3D疎グラフ), Terminal = Local3D(精密)
+        // -----------------------
         public enum AIMode { Lane, Terminal }
         public AIMode CurrentMode => mode;
 
@@ -131,41 +132,57 @@ namespace HighOrbitAI
         public float DebugCeilingY { get; private set; }
         public bool DebugInKeepOut { get; private set; }
 
+        // DebugView互換（戦闘なしの固定）
         public bool DebugMelee { get; private set; }
         public bool DebugShooting { get; private set; }
         public bool DebugBoost { get; private set; }
         public bool DebugEvade { get; private set; }
-
-        public float DebugUnderFire01 { get; private set; }
-        public float DebugTargeted01 { get; private set; }
-
-        public string DebugTactic { get; private set; }
         public string DebugPhase { get; private set; }
+        public string DebugTactic { get; private set; }
         public TacticalDirector.AltitudeBand DebugBand { get; private set; }
 
+        public int DebugWaypointIndex => waypointIndex;
+        public int DebugWaypointCount => cachedWaypoints.Count;
+
+        // -----------------------
+        // Internals
+        // -----------------------
         AIMode mode = AIMode.Lane;
-
-        LowAltitudeLaneGraph laneGraph;
-        LowAltitudeLaneGraphBuilder laneBuilder;
-        AStarLaneVariety laneAstar;
-        LocalGridPlannerVariety localPlanner;
-
-        readonly List<Vector3> lanePath = new List<Vector3>(256);
-        readonly List<Vector3> localPath = new List<Vector3>(256);
+        AIMode lastMode = AIMode.Lane;
 
         readonly List<Transform> cachedWaypoints = new List<Transform>(128);
         int waypointIndex = 0;
+        float lastGoalSwitchTime = -999f;
 
         float decisionTimer;
-        bool graphReady;
-        int lastDbRevision;
-        Bounds cachedWorldBounds;
+        float planTimer;
 
-        float lastGoalSwitchTime = -999f;
         Vector3 currentTarget;
         Vector3 currentGoal;
+        Vector3 lastPlannedGoal;
 
-        int agentId;
+        // 共有ガード（動的更新を1フレーム1回）
+        static int s_lastDynTickFrame = -1;
+        static VolumeCollector s_lastDynTickCollector = null;
+
+        // setPath微小更新抑制
+        readonly List<Vector3> lastSentPath = new List<Vector3>(256);
+
+        // プランずらし
+        float heavyPhaseOffset;
+
+        // --- 3D cruise graph ---
+        AirLaneGraph cruiseGraph;
+        AirLaneGraph3DBuilder cruiseBuilder;
+        AStarAirLane cruiseAstar;
+        bool cruiseGraphReady;
+        Bounds cachedWorldBounds;
+        int lastDbRevision;
+
+        // --- terminal refine ---
+        LocalGridPlannerVariety localPlanner;
+        readonly List<Vector3> cruisePath = new List<Vector3>(512);
+        readonly List<Vector3> localPath = new List<Vector3>(256);
 
         void Reset()
         {
@@ -174,35 +191,21 @@ namespace HighOrbitAI
 
         void Start()
         {
-            agentId = GetInstanceID();
-            SquadCoordinator.Register(squadId, agentId, squadRole);
-
             if (controller == null) controller = GetComponent<FlightController>();
 
-            combat = null;
-            if (combatStateProvider != null) combat = combatStateProvider as ICombatStateProvider;
-            if (combat == null) combat = GetComponent<ICombatStateProvider>();
-
-            threat = null;
-            if (threatSignalProvider != null) threat = threatSignalProvider as IThreatSignalProvider;
-            if (threat == null) threat = GetComponent<IThreatSignalProvider>();
-
-            targeter = null;
-            if (targetProvider != null) targeter = targetProvider as ITargetProvider;
-            if (targeter == null) targeter = GetComponent<ITargetProvider>();
-
-            laneBuilder = new LowAltitudeLaneGraphBuilder
+            cruiseBuilder = new AirLaneGraph3DBuilder
             {
-                nodeSpacing = laneNodeSpacing,
-                edgeMaxDistance = laneEdgeMaxDist,
-                softCostSamples = 3,
-                groundMask = groundMask,
-                groundCastHeight = groundCastHeight,
-                groundMaxDistance = groundMaxDistance,
+                nodeSpacingXZ = cruiseNodeSpacingXZ,
+                layerSpacingY = cruiseLayerSpacingY,
+                minY = cruiseMinY,
+                maxY = cruiseMaxY,
+                edgeMaxDistance = cruiseEdgeMaxDistance,
+                softCostSamples = cruiseSoftSamples,
+                lowAltitudePenalty = cruiseLowAltPenalty,
+                penaltyBaseY = cruisePenaltyBaseY
             };
 
-            laneAstar = new AStarLaneVariety { tieEpsilon = tieEpsilon, validateEdgesWithDb = true };
-            if (volumeCollector != null) laneAstar.database = volumeCollector.database;
+            cruiseAstar = new AStarAirLane();
 
             localPlanner = new LocalGridPlannerVariety
             {
@@ -216,18 +219,16 @@ namespace HighOrbitAI
 
             lastDbRevision = (volumeCollector != null && volumeCollector.database != null) ? volumeCollector.database.revision : 0;
 
-            DebugLastPlanOk = false;
-            DebugLastPlanMessage = "Init";
+            DebugPhase = "None";
             DebugTactic = "-";
-            DebugPhase = "-";
             DebugBand = TacticalDirector.AltitudeBand.Mid;
 
-            Log(LogLevel.Info, "Started (Next-Gen: Threat + Squad Tactics + Auto Target).");
-        }
+            int id = GetInstanceID();
+            float r01 = Mathf.Abs((id * 1103515245 + 12345) & 0x7fffffff) / (float)int.MaxValue;
+            heavyPhaseOffset = r01;
 
-        void OnDestroy()
-        {
-            SquadCoordinator.Unregister(squadId, agentId);
+            DebugLastPlanOk = false;
+            DebugLastPlanMessage = "Init";
         }
 
         void Update()
@@ -235,282 +236,123 @@ namespace HighOrbitAI
             if (volumeCollector == null || volumeCollector.database == null || controller == null)
                 return;
 
-            volumeCollector.UpdateDynamicVolumes();
+            // Dynamic update: 1x per frame
+            if (s_lastDynTickFrame != Time.frameCount || s_lastDynTickCollector != volumeCollector)
+            {
+                s_lastDynTickFrame = Time.frameCount;
+                s_lastDynTickCollector = volumeCollector;
+                volumeCollector.TickDynamic(Time.deltaTime);
+            }
 
             int revNow = volumeCollector.database.revision;
             if (revNow != lastDbRevision)
             {
                 lastDbRevision = revNow;
-                decisionTimer = 999f;
+                planTimer = 999f;
+                cruiseGraphReady = false;
             }
 
+            // Think (light)
             decisionTimer += Time.deltaTime;
-            if (decisionTimer >= (1f / Mathf.Max(1f, decisionHz)))
+            if (decisionTimer >= 1f / Mathf.Max(1f, decisionHz))
             {
                 decisionTimer = 0f;
 
-                EnsureLaneGraph();
-                SelectNonCombatTarget();
-                ApplyTacticsIfActive();
+                EnsureCruiseGraph();
+                MaybeAdvanceTarget();
 
-                // ★ squadに「今の狙い」を共有（群がり抑制の根）
-                SquadCoordinator.UpdateAssignment(squadId, agentId, combatTarget);
+                currentGoal = BuildGoalFromTarget(currentTarget);
 
-                currentGoal = BuildGoalFromTarget(currentTarget, DebugBand);
                 DebugTarget = currentTarget;
                 DebugGoal = currentGoal;
 
-                float dx = currentGoal.x - transform.position.x;
-                float dz = currentGoal.z - transform.position.z;
-                DebugFlatDistance = Mathf.Sqrt(dx * dx + dz * dz);
+                // DebugView互換（戦闘無し）
+                DebugMelee = DebugShooting = DebugBoost = DebugEvade = false;
+                DebugPhase = "None";
+                DebugTactic = "-";
+                DebugBand = TacticalDirector.AltitudeBand.Mid;
 
-                if (DebugFlatDistance >= laneRange) mode = AIMode.Lane;
-                else if (DebugFlatDistance <= terminalRange) mode = AIMode.Terminal;
+                // KeepOut内か（ゴール地点を軽く判定）
+                volumeCollector.database.EvaluatePoint(currentGoal, 0.8f, out var flags, out _);
+                DebugInKeepOut = (flags & NavFlags.KeepOut) != 0;
 
-                if (mode == AIMode.Lane) PlanLane(currentGoal);
-                else PlanLocal(currentGoal);
+                // mode判定：terminalRange以内ならTerminal(=Local3D)、それ以外はLane(=Cruise3D)
+                DebugFlatDistance = Vector2.Distance(
+                    new Vector2(transform.position.x, transform.position.z),
+                    new Vector2(currentGoal.x, currentGoal.z)
+                );
 
-                if (logEachDecisionTick && logLevel >= LogLevel.Info)
+                mode = (DebugFlatDistance <= terminalRange) ? AIMode.Terminal : AIMode.Lane;
+
+                if (logModeChange && mode != lastMode)
                 {
-                    Log(LogLevel.Info,
-                        $"Tick mode={mode}, phase={DebugPhase}, tactic={DebugTactic}, role={squadRole}, squad={squadId}, underFire={DebugUnderFire01:0.00}, targeted={DebugTargeted01:0.00}, ok={DebugLastPlanOk}");
+                    Log(LogLevel.Info, $"ModeChange: {lastMode} -> {mode} (flat={DebugFlatDistance:0.0})");
+                    lastMode = mode;
                 }
+            }
+
+            // Plan (heavy)
+            float planInterval = (planHz <= 0f) ? 0f : (1f / Mathf.Max(0.1f, planHz));
+            planTimer += Time.deltaTime;
+
+            bool goalMoved = (Vector2.Distance(
+                new Vector2(currentGoal.x, currentGoal.z),
+                new Vector2(lastPlannedGoal.x, lastPlannedGoal.z)
+            ) >= Mathf.Max(0.01f, replanGoalDeltaXZ));
+
+            bool timeToPlan = (planHz <= 0f) || (planTimer >= planInterval);
+
+            bool phaseOk = true;
+            if (staggerHeavyWork && planInterval > 0f)
+            {
+                float phase = (Time.time / planInterval) % 1f;
+                float distPhase = Mathf.Abs(phase - heavyPhaseOffset);
+                distPhase = Mathf.Min(distPhase, 1f - distPhase);
+                phaseOk = distPhase < 0.18f;
+            }
+
+            if ((timeToPlan && phaseOk) || goalMoved)
+            {
+                planTimer = 0f;
+                Plan3D(currentGoal);
+                lastPlannedGoal = currentGoal;
             }
 
             controller.Tick(Time.deltaTime);
-            EnforceKeepOut();
         }
 
-        void SelectNonCombatTarget()
-        {
-            if (routeMode == RouteMode.RandomRoam)
-            {
-                if (ShouldSwitchGoalXZ(currentTarget))
-                    currentTarget = PickRandomRoamTarget();
-                return;
-            }
-
-            if (cachedWaypoints.Count == 0)
-            {
-                routeMode = RouteMode.RandomRoam;
-                currentTarget = PickRandomRoamTarget();
-                return;
-            }
-
-            currentTarget = cachedWaypoints[waypointIndex].position;
-            if (ShouldSwitchGoalXZ(currentTarget))
-                AdvanceWaypoint();
-        }
-
-        bool ShouldSwitchGoalXZ(Vector3 target)
-        {
-            if (Time.time - lastGoalSwitchTime < minSecondsBetweenGoalSwitch) return false;
-
-            float dx = target.x - transform.position.x;
-            float dz = target.z - transform.position.z;
-            float d = Mathf.Sqrt(dx * dx + dz * dz);
-            return d <= waypointReachDistXZ;
-        }
-
-        void EnsureInitialTarget()
-        {
-            if (routeMode == RouteMode.RandomRoam)
-            {
-                currentTarget = PickRandomRoamTarget();
-                return;
-            }
-
-            if (cachedWaypoints.Count == 0)
-            {
-                routeMode = RouteMode.RandomRoam;
-                currentTarget = PickRandomRoamTarget();
-                return;
-            }
-
-            waypointIndex = Mathf.Clamp(waypointIndex, 0, cachedWaypoints.Count - 1);
-            currentTarget = cachedWaypoints[waypointIndex].position;
-        }
-
-        void AdvanceWaypoint()
-        {
-            lastGoalSwitchTime = Time.time;
-
-            if (shuffleWaypoints)
-            {
-                waypointIndex = Random.Range(0, cachedWaypoints.Count);
-                currentTarget = cachedWaypoints[waypointIndex].position;
-                return;
-            }
-
-            waypointIndex++;
-            if (waypointIndex >= cachedWaypoints.Count)
-            {
-                if (loopWaypoints) waypointIndex = 0;
-                else waypointIndex = cachedWaypoints.Count - 1;
-            }
-
-            currentTarget = cachedWaypoints[waypointIndex].position;
-        }
-
-        void BuildWaypointCache()
-        {
-            cachedWaypoints.Clear();
-
-            if (waypoints != null && waypoints.Length > 0)
-            {
-                for (int i = 0; i < waypoints.Length; i++)
-                    if (waypoints[i] != null) cachedWaypoints.Add(waypoints[i]);
-            }
-
-            if (cachedWaypoints.Count == 0 && waypointRoot != null)
-            {
-                for (int i = 0; i < waypointRoot.childCount; i++)
-                {
-                    var t = waypointRoot.GetChild(i);
-                    if (t != null) cachedWaypoints.Add(t);
-                }
-            }
-
-            if (cachedWaypoints.Count == 0)
-            {
-                var rp = FindFirstObjectByType<RoutePath>();
-                if (rp != null && rp.points != null && rp.points.Count > 0)
-                {
-                    for (int i = 0; i < rp.points.Count; i++)
-                        if (rp.points[i] != null) cachedWaypoints.Add(rp.points[i]);
-                }
-            }
-        }
-
-        Vector3 PickRandomRoamTarget()
-        {
-            if (autoEstimateRoamBoundsFromColliders && cachedWorldBounds.size.sqrMagnitude > 1f)
-                roamBounds = cachedWorldBounds;
-
-            Vector2 dir = Random.insideUnitCircle.normalized;
-            float seg = Random.Range(roamMinSegment, roamMaxSegment);
-
-            Vector3 p = transform.position + new Vector3(dir.x, 0f, dir.y) * seg;
-
-            Vector3 c = roamBounds.center;
-            Vector3 e = roamBounds.extents;
-            p.x = Mathf.Clamp(p.x, c.x - e.x, c.x + e.x);
-            p.z = Mathf.Clamp(p.z, c.z - e.z, c.z + e.z);
-
-            lastGoalSwitchTime = Time.time;
-            return p;
-        }
-
-        void ApplyTacticsIfActive()
-        {
-            DebugMelee = combat != null && combat.IsMeleeEngaging;
-            DebugShooting = combat != null && combat.IsShooting;
-            DebugBoost = combat != null && combat.IsBoosting;
-            DebugEvade = combat != null && combat.IsEvading;
-
-            DebugUnderFire01 = threat != null ? Mathf.Clamp01(threat.UnderFire01) : 0f;
-            DebugTargeted01 = threat != null ? Mathf.Clamp01(threat.Targeted01) : 0f;
-
-            // ★ 自動ターゲット（Squad/Threat aware）
-            if (autoAcquireTarget && targeter != null)
-            {
-                var q = new TargetQuery
-                {
-                    self = transform,
-                    selfForward = transform.forward,
-                    db = (volumeCollector != null) ? volumeCollector.database : null,
-                    agentRadius = agentRadius,
-                    underFire01 = DebugUnderFire01,
-                    targeted01 = DebugTargeted01,
-                    squadId = squadId,
-                    squadRole = squadRole,
-                    currentTarget = combatTarget,
-                    nowTime = Time.time
-                };
-
-                combatTarget = targeter.SelectTarget(in q);
-            }
-
-            if (!enableTactics || combatTarget == null)
-            {
-                DebugTactic = "-";
-                DebugPhase = tactics.CurrentPhase.ToString();
-                DebugBand = TacticalDirector.AltitudeBand.Mid;
-                return;
-            }
-
-            Vector3 to = combatTarget.position - transform.position;
-            float distXZ = Mathf.Sqrt(to.x * to.x + to.z * to.z);
-            if (distXZ > tacticsActivateDistXZ)
-            {
-                DebugTactic = "-";
-                DebugPhase = tactics.CurrentPhase.ToString();
-                DebugBand = TacticalDirector.AltitudeBand.High;
-                return;
-            }
-
-            volumeCollector.database.EvaluatePoint(transform.position, agentRadius, out var flags, out _);
-            DebugInKeepOut = (flags & NavFlags.KeepOut) != 0;
-
-            // TacticalDirector 側は「敵の選択後」に動く（既存のままでOK）
-            var res = tactics.Decide(
-                transform.position,
-                transform.forward,
-                combatTarget,
-                volumeCollector.database,
-                agentRadius,
-                DebugInKeepOut,
-                combat,
-                DebugUnderFire01,
-                DebugTargeted01,
-                Time.time);
-
-            DebugTactic = res.tactic.ToString();
-            DebugPhase = res.phase.ToString();
-            DebugBand = res.band;
-
-            currentTarget = res.targetPos;
-
-            controller.SetProfile(res.profile, res.profileHold);
-            controller.SetExtraSteer(res.extraSteer);
-        }
-
-        Vector3 BuildGoalFromTarget(Vector3 target, TacticalDirector.AltitudeBand band)
+        Vector3 BuildGoalFromTarget(Vector3 target)
         {
             float groundY;
             bool hasGround = GroundSampler.TryGetGroundY(target, groundCastHeight, groundMaxDistance, groundMask, out groundY);
             if (!hasGround) groundY = target.y;
 
-            float add =
-                band == TacticalDirector.AltitudeBand.Low ? bandLowAdd :
-                band == TacticalDirector.AltitudeBand.High ? bandHighAdd :
-                bandMidAdd;
-
-            float desiredY = Mathf.Clamp(
-                groundY + lowHeight + add,
-                groundY + minAboveGround,
-                groundY + ceilingAboveGround + add);
-
-            float ceilingY = groundY + ceilingAboveGround + add;
-
+            float desiredY = Mathf.Clamp(groundY + lowHeight, groundY + minAboveGround, groundY + ceilingAboveGround);
+            float ceilingY = groundY + ceilingAboveGround;
             DebugDesiredY = desiredY;
             DebugCeilingY = ceilingY;
 
             return new Vector3(target.x, desiredY, target.z);
         }
 
-        void EnsureLaneGraph()
+        void EnsureCruiseGraph()
         {
-            if (graphReady) return;
+            if (cruiseGraphReady && cruiseGraph != null && cruiseGraph.nodes.Count > 0) return;
 
             cachedWorldBounds = EstimateWorldBounds();
-            cachedWorldBounds.Expand(new Vector3(1200, 800, 1200));
+            cachedWorldBounds.Expand(new Vector3(1400f, 0f, 1400f));
 
-            laneBuilder.nodeSpacing = laneNodeSpacing;
-            laneBuilder.edgeMaxDistance = laneEdgeMaxDist;
+            cruiseBuilder.nodeSpacingXZ = cruiseNodeSpacingXZ;
+            cruiseBuilder.layerSpacingY = cruiseLayerSpacingY;
+            cruiseBuilder.minY = cruiseMinY;
+            cruiseBuilder.maxY = cruiseMaxY;
+            cruiseBuilder.edgeMaxDistance = cruiseEdgeMaxDistance;
+            cruiseBuilder.softCostSamples = cruiseSoftSamples;
+            cruiseBuilder.lowAltitudePenalty = cruiseLowAltPenalty;
+            cruiseBuilder.penaltyBaseY = cruisePenaltyBaseY;
 
-            laneGraph = laneBuilder.Build(cachedWorldBounds, lowHeight, ceilingAboveGround, volumeCollector.database, agentRadius);
-            graphReady = (laneGraph != null && laneGraph.nodes.Count > 0);
+            cruiseGraph = cruiseBuilder.Build(cachedWorldBounds, volumeCollector.database, 0.7f);
+            cruiseGraphReady = cruiseGraph != null && cruiseGraph.nodes.Count > 0;
         }
 
         Bounds EstimateWorldBounds()
@@ -528,6 +370,74 @@ namespace HighOrbitAI
             return b;
         }
 
+        int FindNearestCruiseNode(Vector3 p)
+        {
+            if (cruiseGraph == null || cruiseGraph.nodes.Count == 0) return -1;
+
+            int best = 0;
+            float bestD = float.PositiveInfinity;
+
+            for (int i = 0; i < cruiseGraph.nodes.Count; i++)
+            {
+                Vector3 np = cruiseGraph.nodes[i].pos;
+                float dx = np.x - p.x;
+                float dy = np.y - p.y;
+                float dz = np.z - p.z;
+                float d = dx * dx + dy * dy + dz * dz;
+                if (d < bestD) { best = i; bestD = d; }
+            }
+            return best;
+        }
+
+        void Plan3D(Vector3 goal)
+        {
+            if (!cruiseGraphReady || cruiseGraph == null || cruiseGraph.nodes.Count == 0)
+            {
+                var direct = new List<Vector3> { transform.position, goal };
+                SendPathIfChanged(direct);
+                DebugLastPlanOk = false;
+                DebugLastPlanMessage = "Cruise3DGraph not ready -> direct";
+                return;
+            }
+
+            if (mode == AIMode.Terminal)
+            {
+                PlanTerminalLocal3D(goal);
+                return;
+            }
+
+            int s = FindNearestCruiseNode(transform.position);
+            int g = FindNearestCruiseNode(goal);
+            if (s < 0 || g < 0)
+            {
+                var direct = new List<Vector3> { transform.position, goal };
+                SendPathIfChanged(direct);
+                DebugLastPlanOk = false;
+                DebugLastPlanMessage = "Nearest node missing -> direct";
+                return;
+            }
+
+            bool ok = cruiseAstar.FindPath(cruiseGraph, s, g, cruisePath);
+            DebugLastPlanOk = ok;
+
+            if (ok)
+            {
+                var path = new List<Vector3>(cruisePath.Count + 2);
+                path.Add(transform.position);
+                path.AddRange(cruisePath);
+                path.Add(goal);
+
+                SendPathIfChanged(path);
+                DebugLastPlanMessage = $"Cruise3D ok nodes={cruisePath.Count}";
+            }
+            else
+            {
+                var direct = new List<Vector3> { transform.position, goal };
+                SendPathIfChanged(direct);
+                DebugLastPlanMessage = "Cruise3D failed -> direct";
+            }
+        }
+
         int ComputeVarietySeed()
         {
             int t = Mathf.FloorToInt(Time.time / Mathf.Max(0.25f, varietyPeriod));
@@ -535,66 +445,24 @@ namespace HighOrbitAI
             unchecked { return b * 19349663 ^ t * 83492791; }
         }
 
-        void PlanLane(Vector3 goal)
+        void PlanTerminalLocal3D(Vector3 goal)
         {
-            if (!graphReady)
-            {
-                DebugLastPlanOk = false;
-                DebugLastPlanMessage = "Lane: graph not ready";
-                controller.SetPath(new List<Vector3> { transform.position, goal });
-                return;
-            }
-
-            int start = FindNearestLaneNode(transform.position);
-            int end = FindNearestLaneNode(goal);
-            if (start < 0 || end < 0)
-            {
-                DebugLastPlanOk = false;
-                DebugLastPlanMessage = "Lane: no nodes";
-                controller.SetPath(new List<Vector3> { transform.position, goal });
-                return;
-            }
-
-            int seed = ComputeVarietySeed();
-            laneAstar.tieEpsilon = tieEpsilon;
-
-            bool ok = laneAstar.FindPath(laneGraph, start, end, seed, lanePath);
-            DebugLastPlanOk = ok;
-
-            if (ok)
-            {
-                var path = new List<Vector3>(lanePath.Count + 2);
-                path.Add(transform.position);
-                path.AddRange(lanePath);
-                path.Add(goal);
-                controller.SetPath(path);
-                DebugLastPlanMessage = $"Lane: path={path.Count}";
-            }
-            else
-            {
-                controller.SetPath(new List<Vector3> { transform.position, goal });
-                DebugLastPlanMessage = "Lane: A* failed -> direct";
-            }
-        }
-
-        void PlanLocal(Vector3 goal)
-        {
-            int seed = ComputeVarietySeed();
-
             localPlanner.cellSize = localCellSize;
             localPlanner.localRadius = localRadius;
             localPlanner.tieEpsilon = tieEpsilon;
 
+            int seed = ComputeVarietySeed();
+
             bool ok = localPlanner.FindPath(
                 transform.position, goal,
                 volumeCollector.database,
-                agentRadius,
-                controller.cruise.maxClimbRate,
-                controller.cruise.maxSpeed,
-                DebugDesiredY,
-                DebugCeilingY,
-                seed,
-                localPath
+                agentRadius: 0.9f,
+                maxClimbRate: controller.cruise.maxClimbRate,
+                maxSpeed: controller.cruise.maxSpeed,
+                desiredY: DebugDesiredY,
+                ceilingY: DebugCeilingY,
+                seed: seed,
+                outPath: localPath
             );
 
             DebugLastPlanOk = ok;
@@ -604,41 +472,163 @@ namespace HighOrbitAI
                 var path = new List<Vector3>(localPath.Count + 1);
                 path.Add(transform.position);
                 path.AddRange(localPath);
-                controller.SetPath(path);
-                DebugLastPlanMessage = $"Terminal: path={path.Count}";
+                SendPathIfChanged(path);
+                DebugLastPlanMessage = $"Terminal3D ok nodes={localPath.Count}";
             }
             else
             {
-                controller.SetPath(new List<Vector3> { transform.position, goal });
-                DebugLastPlanMessage = "Terminal: A* failed -> direct";
+                var direct = new List<Vector3> { transform.position, goal };
+                SendPathIfChanged(direct);
+                DebugLastPlanMessage = "Terminal3D failed -> direct";
             }
         }
 
-        int FindNearestLaneNode(Vector3 p)
+        void SendPathIfChanged(List<Vector3> path)
         {
-            if (laneGraph == null || laneGraph.nodes.Count == 0) return -1;
+            if (path == null || path.Count == 0) return;
+            if (!PathChangedSignificantly(path)) return;
 
-            int best = 0;
-            float bestD = float.PositiveInfinity;
-            for (int i = 0; i < laneGraph.nodes.Count; i++)
+            controller.SetPath(path);
+
+            lastSentPath.Clear();
+            for (int i = 0; i < path.Count; i++) lastSentPath.Add(path[i]);
+        }
+
+        bool PathChangedSignificantly(List<Vector3> newPath)
+        {
+            if (lastSentPath.Count == 0) return true;
+            int n = Mathf.Min(3, Mathf.Min(newPath.Count, lastSentPath.Count));
+
+            for (int i = 0; i < n; i++)
             {
-                Vector3 np = laneGraph.nodes[i].pos;
-                float dx = np.x - p.x;
-                float dz = np.z - p.z;
-                float d = dx * dx + dz * dz;
-                if (d < bestD) { best = i; bestD = d; }
+                float d = Vector3.Distance(newPath[i], lastSentPath[i]);
+                if (d > pathChangeEpsilon) return true;
             }
-            return best;
+            return false;
         }
 
-        void EnforceKeepOut()
+        // -----------------------
+        // Waypoints / Roam
+        // -----------------------
+        void BuildWaypointCache()
         {
-            if (!DebugInKeepOut) return;
+            cachedWaypoints.Clear();
 
-            Vector3 fwd = transform.forward;
-            Vector3 right = transform.right;
-            Vector3 push = (right * 0.8f) + (fwd * 0.2f) + (Vector3.up * 0.25f);
-            controller.ApplyKeepOutPush(push, Time.deltaTime);
+            if (waypoints != null && waypoints.Length > 0)
+                for (int i = 0; i < waypoints.Length; i++)
+                    if (waypoints[i] != null) cachedWaypoints.Add(waypoints[i]);
+
+            if (cachedWaypoints.Count == 0 && waypointRoot != null)
+                for (int i = 0; i < waypointRoot.childCount; i++)
+                    cachedWaypoints.Add(waypointRoot.GetChild(i));
+
+            if (shuffleWaypoints && cachedWaypoints.Count > 1)
+                Shuffle(cachedWaypoints);
+
+            if (cachedWaypoints.Count == 0 && routeMode == RouteMode.Waypoints)
+                routeMode = RouteMode.RandomRoam;
+
+            if (autoEstimateRoamBoundsFromColliders)
+                roamBounds = EstimateRoamBoundsFallback(roamBounds);
+        }
+
+        void EnsureInitialTarget()
+        {
+            if (routeMode == RouteMode.Waypoints && cachedWaypoints.Count > 0)
+            {
+                waypointIndex = Mathf.Clamp(waypointIndex, 0, cachedWaypoints.Count - 1);
+                currentTarget = cachedWaypoints[waypointIndex].position;
+                lastGoalSwitchTime = Time.time;
+                return;
+            }
+
+            currentTarget = PickRoamTarget(transform.position);
+            lastGoalSwitchTime = Time.time;
+        }
+
+        void MaybeAdvanceTarget()
+        {
+            Vector2 a = new Vector2(transform.position.x, transform.position.z);
+            Vector2 b = new Vector2(currentTarget.x, currentTarget.z);
+            float dist = Vector2.Distance(a, b);
+
+            bool close = dist <= waypointReachDistXZ;
+            bool timeOk = (Time.time - lastGoalSwitchTime) >= minSecondsBetweenGoalSwitch;
+
+            if (!close || !timeOk)
+            {
+                if (routeMode == RouteMode.Waypoints && cachedWaypoints.Count > 0)
+                {
+                    var t = cachedWaypoints[Mathf.Clamp(waypointIndex, 0, cachedWaypoints.Count - 1)];
+                    if (t != null) currentTarget = t.position;
+                }
+                return;
+            }
+
+            if (routeMode == RouteMode.Waypoints && cachedWaypoints.Count > 0)
+            {
+                waypointIndex++;
+                if (waypointIndex >= cachedWaypoints.Count)
+                    waypointIndex = loopWaypoints ? 0 : cachedWaypoints.Count - 1;
+
+                currentTarget = cachedWaypoints[waypointIndex].position;
+                lastGoalSwitchTime = Time.time;
+                return;
+            }
+
+            currentTarget = PickRoamTarget(transform.position);
+            lastGoalSwitchTime = Time.time;
+        }
+
+        Vector3 PickRoamTarget(Vector3 from)
+        {
+            for (int i = 0; i < 24; i++)
+            {
+                float rx = Random.Range(roamBounds.min.x, roamBounds.max.x);
+                float rz = Random.Range(roamBounds.min.z, roamBounds.max.z);
+
+                float d = Vector2.Distance(new Vector2(from.x, from.z), new Vector2(rx, rz));
+                if (d < roamMinSegment) continue;
+                if (d > roamMaxSegment) continue;
+
+                return new Vector3(rx, from.y, rz);
+            }
+
+            return new Vector3(
+                Random.Range(roamBounds.min.x, roamBounds.max.x),
+                from.y,
+                Random.Range(roamBounds.min.z, roamBounds.max.z)
+            );
+        }
+
+        static void Shuffle<T>(List<T> list)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                int j = Random.Range(i, list.Count);
+                (list[i], list[j]) = (list[j], list[i]);
+            }
+        }
+
+        Bounds EstimateRoamBoundsFallback(Bounds fallback)
+        {
+            var cols = FindObjectsByType<Collider>(FindObjectsSortMode.None);
+            bool init = false;
+            Bounds b = fallback;
+
+            foreach (var c in cols)
+            {
+                if (!c.enabled) continue;
+                if (!init) { b = c.bounds; init = true; }
+                else b.Encapsulate(c.bounds);
+            }
+
+            if (!init) return fallback;
+
+            b.Expand(new Vector3(800, 0, 800));
+            b.center = new Vector3(b.center.x, fallback.center.y, b.center.z);
+            b.size = new Vector3(b.size.x, fallback.size.y, b.size.z);
+            return b;
         }
     }
 }
