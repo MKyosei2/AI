@@ -23,11 +23,35 @@ namespace HighOrbitAI
 
         readonly List<int> tmpIds = new List<int>(256);
 
+        // -----------------------------
+        // Revisions
+        // -----------------------------
         /// <summary>
-        /// DB内容が変わるたびに増えるリビジョン。
-        /// ルートAI側で「障害物状態が変わった」検知に使える。
+        /// 互換用（従来）：DB内容が変わるたびに増えるリビジョン。
+        /// ※静的/動的の区別が必要なら staticRevision / dynamicRevision を使う。
         /// </summary>
         public int revision { get; private set; } = 0;
+
+        /// <summary>
+        /// 静的構造（ノード生成/エッジ判定の前提）が変わった時に増える。
+        /// → Cruiseグラフ再構築のトリガーに使う。
+        /// </summary>
+        public int staticRevision { get; private set; } = 0;
+
+        /// <summary>
+        /// 動的状態（移動/ドア開閉/危険度など）が変わった時に増える。
+        /// → Cruiseグラフは再構築せず、再プランだけのトリガーに使う。
+        /// </summary>
+        public int dynamicRevision { get; private set; } = 0;
+
+        const float kBoundsEps = 1e-6f;
+
+        static bool BoundsApproximatelyEqual(in Bounds a, in Bounds b)
+        {
+            Vector3 dc = a.center - b.center;
+            Vector3 de = a.extents - b.extents;
+            return (dc.sqrMagnitude <= kBoundsEps) && (de.sqrMagnitude <= kBoundsEps);
+        }
 
         public void Initialize(float dynamicCellSize)
         {
@@ -35,19 +59,26 @@ namespace HighOrbitAI
         }
 
         public void ClearAll()
-{
-    volumes.Clear();
-    staticIds.Clear();
-    dynamicIds.Clear();
-    staticBvh = null;
-    dynamicHash?.Clear();
-    revision++;
-}
+        {
+            volumes.Clear();
+            staticIds.Clear();
+            dynamicIds.Clear();
+            staticBvh = null;
+            dynamicHash?.Clear();
 
-public int AddVolume(VolumeLite v)
+            // DB全体が変わるので安全側に両方進める
+            staticRevision++;
+            dynamicRevision++;
+            revision++;
+        }
+
+        public int AddVolume(VolumeLite v)
         {
             int id = volumes.Count;
             volumes.Add(v);
+
+            // 構造が変わる（静的/動的どちらでも）＝グラフ前提が変わる可能性が高い
+            staticRevision++;
             revision++;
             return id;
         }
@@ -76,27 +107,52 @@ public int AddVolume(VolumeLite v)
         public void UpdateDynamicBounds(int id, Bounds newBounds)
         {
             var v = volumes[id];
+
+            // 変化なしなら何もしない（再プラン/Hash再構築の無駄を減らす）
+            if (BoundsApproximatelyEqual(v.aabb, newBounds))
+                return;
+
             v.aabb = newBounds;
             volumes[id] = v;
+
+            dynamicRevision++;
             revision++;
         }
 
         public void UpdateDynamicState(int id, NavFlags flags, float costAdd)
         {
             var v = volumes[id];
+
+            bool same = (v.flags == flags) && Mathf.Approximately(v.costAdd, costAdd);
+            if (same)
+                return;
+
             v.flags = flags;
             v.costAdd = costAdd;
             volumes[id] = v;
+
+            dynamicRevision++;
             revision++;
         }
 
         public void UpdateDynamicAll(int id, Bounds newBounds, NavFlags flags, float costAdd)
         {
             var v = volumes[id];
+
+            bool same =
+                BoundsApproximatelyEqual(v.aabb, newBounds) &&
+                (v.flags == flags) &&
+                Mathf.Approximately(v.costAdd, costAdd);
+
+            if (same)
+                return;
+
             v.aabb = newBounds;
             v.flags = flags;
             v.costAdd = costAdd;
             volumes[id] = v;
+
+            dynamicRevision++;
             revision++;
         }
 

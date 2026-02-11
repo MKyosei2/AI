@@ -12,11 +12,22 @@ namespace HighOrbitAI
         public float dynamicCellSize = 10f;
 
         [Header("Perf")]
-        [Tooltip("動的Volumeの更新を行うか")]
         public bool enableDynamicUpdates = true;
 
-        [Tooltip("動的Volumeの更新頻度(Hz)。5〜10推奨。0なら毎フレーム更新。")]
-        public float dynamicUpdateHz = 5f;
+        [Tooltip("動的Volumeの更新頻度(Hz)。0なら毎フレーム更新。2〜5推奨。")]
+        public float dynamicUpdateHz = 4f;
+
+        [Header("World Bounds (for Cruise Graph)")]
+        [Tooltip("Build時に収集した“静的”領域Bounds。Cruiseグラフ生成の基準に使う。")]
+        public Bounds staticWorldBounds;
+
+        [Tooltip("staticWorldBoundsに足す余白(XZ)。大きいほど重い。")]
+        public float staticWorldPaddingXZ = 80f;
+
+        [Tooltip("静的Boundsの代わりにこのBoundsを強制使用（巨大マップ対策）。")]
+        public bool useOverrideWorldBounds = false;
+
+        public Bounds overrideWorldBounds = new Bounds(Vector3.zero, new Vector3(800, 200, 800));
 
         public VolumeDatabase database;
 
@@ -35,30 +46,63 @@ namespace HighOrbitAI
 
         void Awake()
         {
-            database = new VolumeDatabase();
-            database.Initialize(dynamicCellSize);
+            EnsureDatabase();
             Build();
+        }
+
+        // ★追加：EditorからBuildが呼ばれても落ちないようにする
+        void EnsureDatabase()
+        {
+            if (database == null)
+            {
+                database = new VolumeDatabase();
+                database.Initialize(dynamicCellSize);
+            }
+            else
+            {
+                // dynamicCellSize が Inspector で変更された場合に備える
+                // VolumeDatabase側に再Initializeが不要ならこのままでOK
+                //（必要なら、VolumeDatabaseに「Initialized」フラグがある前提で調整）
+            }
+        }
+
+        public Bounds GetWorldBoundsForCruise()
+        {
+            if (useOverrideWorldBounds) return overrideWorldBounds;
+
+            var b = staticWorldBounds;
+            float pad = Mathf.Max(0f, staticWorldPaddingXZ);
+            b.Expand(new Vector3(pad * 2f, 0f, pad * 2f));
+            return b;
         }
 
         public void Build()
         {
+            // ★ここが今回のNullRef対策の核心
+            EnsureDatabase();
+
             database.ClearAll();
 
             dynamicEntries.Clear();
-            CollectLayerColliders();
-            CollectZones();
-            CollectConditionalVolumes();
+
+            bool boundsInit = false;
+            Bounds bounds = default;
+
+            CollectLayerColliders(ref boundsInit, ref bounds);
+            CollectZones(ref boundsInit, ref bounds);
+            CollectConditionalVolumes(ref boundsInit, ref bounds);
+
+            if (!boundsInit)
+                bounds = new Bounds(transform.position, new Vector3(400, 200, 400));
+
+            staticWorldBounds = bounds;
 
             database.BuildStaticBVH();
 
-            // 動的が無いならハッシュも不要（ここが地味に効く）
             if (dynamicEntries.Count > 0)
                 database.RebuildDynamicHash();
         }
 
-        /// <summary>
-        /// 超軽量：動的更新はここを呼ぶ（間引き込み）
-        /// </summary>
         public void TickDynamic(float dt)
         {
             if (!enableDynamicUpdates) return;
@@ -78,7 +122,7 @@ namespace HighOrbitAI
             UpdateDynamicVolumesImmediate();
         }
 
-        // 互換用：従来どおり呼ばれても動く（＝即時更新）
+        // 互換用
         public void UpdateDynamicVolumes()
         {
             if (dynamicEntries.Count == 0) return;
@@ -87,44 +131,56 @@ namespace HighOrbitAI
 
         void UpdateDynamicVolumesImmediate()
         {
+            bool anyChanged = false;
+
             for (int i = 0; i < dynamicEntries.Count; i++)
             {
                 var e = dynamicEntries[i];
+                int before = database.dynamicRevision;
 
                 if (e.collider != null)
                 {
                     database.UpdateDynamicBounds(e.volumeId, e.collider.bounds);
-                    continue;
                 }
-                if (e.keepOut != null)
+                else if (e.keepOut != null)
                 {
                     database.UpdateDynamicBounds(e.volumeId, e.keepOut.GetInflatedBounds(agentRadius));
-                    continue;
                 }
-                if (e.softAvoid != null)
+                else if (e.softAvoid != null)
                 {
                     database.UpdateDynamicBounds(e.volumeId, e.softAvoid.GetInflatedBounds(agentRadius));
-                    continue;
                 }
-                if (e.conditional != null)
+                else if (e.conditional != null)
                 {
                     e.conditional.GetCurrent(agentRadius, out Bounds b, out NavFlags flags, out float costAdd);
                     flags |= NavFlags.Dynamic;
                     database.UpdateDynamicAll(e.volumeId, b, flags, costAdd);
-                    continue;
                 }
+
+                if (database.dynamicRevision != before)
+                    anyChanged = true;
             }
 
-            // ★ここが重いので「動的がある時だけ」「間引き済み」で呼ぶ
-            database.RebuildDynamicHash();
+            if (anyChanged)
+                database.RebuildDynamicHash();
         }
 
-        void CollectLayerColliders()
+        void Encapsulate(ref bool init, ref Bounds b, Bounds add)
+        {
+            if (!init)
+            {
+                b = add;
+                init = true;
+            }
+            else b.Encapsulate(add);
+        }
+
+        void CollectLayerColliders(ref bool boundsInit, ref Bounds bounds)
         {
             var cols = FindObjectsByType<Collider>(FindObjectsSortMode.None);
             foreach (var col in cols)
             {
-                if (!col.enabled) continue;
+                if (col == null || !col.enabled) continue;
 
                 var go = col.gameObject;
                 int layerBit = 1 << go.layer;
@@ -134,11 +190,17 @@ namespace HighOrbitAI
 
                 if (!isDyn && !isSta) continue;
 
+                // Zone/Conditionalは別扱い
                 if (go.GetComponent<KeepOutZone>() != null) continue;
                 if (go.GetComponent<SoftAvoidZone>() != null) continue;
                 if (go.GetComponent<ConditionalVolume>() != null) continue;
 
                 Bounds b = col.bounds;
+
+                // ★静的だけをBounds計算に使う（動的でBoundsが暴れるのを避ける）
+                if (isSta)
+                    Encapsulate(ref boundsInit, ref bounds, b);
+
                 var flags = NavFlags.Blocked | (isDyn ? NavFlags.Dynamic : NavFlags.None);
                 int id = database.AddVolume(new VolumeLite(b, flags, 0f));
 
@@ -154,12 +216,18 @@ namespace HighOrbitAI
             }
         }
 
-        void CollectZones()
+        void CollectZones(ref bool boundsInit, ref Bounds bounds)
         {
             var keepOuts = FindObjectsByType<KeepOutZone>(FindObjectsSortMode.None);
             foreach (var kz in keepOuts)
             {
+                if (kz == null) continue;
+
                 Bounds b = kz.GetInflatedBounds(agentRadius);
+
+                if (!kz.isDynamic)
+                    Encapsulate(ref boundsInit, ref bounds, b);
+
                 var flags = NavFlags.KeepOut | (kz.isDynamic ? NavFlags.Dynamic : NavFlags.None);
                 int id = database.AddVolume(new VolumeLite(b, flags, 0f));
 
@@ -174,7 +242,13 @@ namespace HighOrbitAI
             var softs = FindObjectsByType<SoftAvoidZone>(FindObjectsSortMode.None);
             foreach (var sz in softs)
             {
+                if (sz == null) continue;
+
                 Bounds b = sz.GetInflatedBounds(agentRadius);
+
+                if (!sz.isDynamic)
+                    Encapsulate(ref boundsInit, ref bounds, b);
+
                 var flags = NavFlags.SoftAvoid | (sz.isDynamic ? NavFlags.Dynamic : NavFlags.None);
                 int id = database.AddVolume(new VolumeLite(b, flags, sz.costAdd));
 
@@ -187,13 +261,14 @@ namespace HighOrbitAI
             }
         }
 
-        void CollectConditionalVolumes()
+        void CollectConditionalVolumes(ref bool boundsInit, ref Bounds bounds)
         {
             var cvs = FindObjectsByType<ConditionalVolume>(FindObjectsSortMode.None);
             foreach (var cv in cvs)
             {
-                cv.GetCurrent(agentRadius, out Bounds b, out NavFlags flags, out float costAdd);
+                if (cv == null) continue;
 
+                cv.GetCurrent(agentRadius, out Bounds b, out NavFlags flags, out float costAdd);
                 flags |= NavFlags.Dynamic;
 
                 int id = database.AddVolume(new VolumeLite(b, flags, costAdd));

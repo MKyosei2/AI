@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -5,42 +6,10 @@ namespace HighOrbitAI
 {
     public class HighOrbitAI : MonoBehaviour
     {
-        public enum LogLevel { Off = 0, Error = 1, Warn = 2, Info = 3, Verbose = 4 }
-
-        [Header("Logging (Perf tip: turn off in stress test)")]
-        public bool logEnabled = true;
-        public LogLevel logLevel = LogLevel.Info;
-        public float logThrottleSeconds = 0.15f;
-        public bool logEachDecisionTick = false;
-        public bool logModeChange = false;
-
-        float lastLogTime = -999f;
-        void Log(LogLevel lvl, string msg)
-        {
-            if (!logEnabled) return;
-            if ((int)lvl > (int)logLevel) return;
-
-            float now = Time.time;
-            if (lvl >= LogLevel.Info && (now - lastLogTime) < Mathf.Max(0f, logThrottleSeconds))
-                return;
-
-            lastLogTime = now;
-            string prefix = $"[HighOrbitAI:{name}] ";
-            if (lvl == LogLevel.Error) Debug.LogError(prefix + msg);
-            else if (lvl == LogLevel.Warn) Debug.LogWarning(prefix + msg);
-            else Debug.Log(prefix + msg);
-        }
-
-        // -----------------------
-        // Refs
-        // -----------------------
         [Header("Refs")]
         public VolumeCollector volumeCollector;
         public FlightController controller;
 
-        // -----------------------
-        // Route / Goal Source
-        // -----------------------
         public enum RouteMode { Waypoints, RandomRoam }
 
         [Header("Route Source")]
@@ -56,28 +25,17 @@ namespace HighOrbitAI
 
         [Header("Random Roam")]
         public Bounds roamBounds = new Bounds(Vector3.zero, new Vector3(1400, 200, 1400));
-        public bool autoEstimateRoamBoundsFromColliders = true;
         public float roamMinSegment = 220f;
         public float roamMaxSegment = 520f;
 
-        // -----------------------
-        // Update rates
-        // -----------------------
         [Header("Decision (think rate)")]
-        public float decisionHz = 10f;
+        public float decisionHz = 6f;
 
         [Header("Planning (heavy)")]
-        public float planHz = 4f;
-        public float replanGoalDeltaXZ = 12f;
+        public float planHz = 2f;
+        public float replanGoalDeltaXZ = 14f;
 
-        [Header("Smoothing / Anti-stutter")]
-        public bool staggerHeavyWork = true;
-        public float pathChangeEpsilon = 1.5f;
-
-        // -----------------------
-        // Altitude policy
-        // -----------------------
-        [Header("Altitude Policy")]
+        [Header("Altitude Policy (Terminal)")]
         public float lowHeight = 10f;
         public float ceilingAboveGround = 35f;
         public float minAboveGround = 3f;
@@ -86,41 +44,46 @@ namespace HighOrbitAI
         public float groundCastHeight = 1200f;
         public float groundMaxDistance = 2500f;
 
-        // -----------------------
-        // 3D Cruise Graph (Sparse)
-        // -----------------------
-        [Header("3D Cruise Graph (Sparse, Ultra-light)")]
-        public float cruiseNodeSpacingXZ = 28f;
-        public float cruiseLayerSpacingY = 25f;
+        [Header("3D Cruise Graph (Sparse)")]
+        public float cruiseNodeSpacingXZ = 45f;
+        public float cruiseLayerSpacingY = 45f;
         public float cruiseMinY = 10f;
         public float cruiseMaxY = 320f;
-        public float cruiseEdgeMaxDistance = 95f;
-        public int cruiseSoftSamples = 2;
+        public float cruiseEdgeMaxDistance = 110f;
+        public int cruiseSoftSamples = 0;
 
-        [Tooltip("低高度を嫌う係数。0で無効。")]
-        public float cruiseLowAltPenalty = 0.0015f;
-
-        [Tooltip("この高さ未満にいるほどペナルティ(上へ行きやすくなる)")]
+        public float cruiseLowAltPenalty = 0.0008f;
         public float cruisePenaltyBaseY = 70f;
 
-        // -----------------------
-        // Terminal Local 3D Grid
-        // -----------------------
-        [Header("Terminal 3D Grid (Refine)")]
-        public float terminalRange = 160f;
-        public float localCellSize = 6f;
-        public float localRadius = 140f;
+        [Header("Cruise Build Budget")]
+        [Tooltip("Cruiseグラフ生成の1フレーム予算(ms)。小さいほど滑らか。")]
+        public float cruiseBuildBudgetMs = 2.0f;
+
+        [Header("Cruise Altitude (3D movement)")]
+        [Tooltip("巡航高度の変化スピード(大きいほど上下が素早い)")]
+        public float cruiseAltitudeResponsiveness = 0.6f;
+
+        [Tooltip("巡航高度を時々変更する周期(秒)。小さいほど上下しやすい")]
+        public float cruiseAltitudeChangePeriod = 5.0f;
+
+        [Tooltip("巡航高度のランダム幅(0..1)。0=固定、1=最大で上下")]
+        [Range(0f, 1f)]
+        public float cruiseAltitudeVariety = 0.75f;
+
+        [Header("Terminal Local 3D Grid")]
+        public float terminalRange = 120f;
+        public float localCellSize = 10f;
+        public float localRadius = 95f;
 
         [Header("Variety")]
         public float tieEpsilon = 0.02f;
         public float varietyPeriod = 2.0f;
 
         // -----------------------
-        // DebugView compatibility (IMPORTANT)
-        // DebugView は AIMode.Lane / AIMode.Terminal を期待している
-        // ここでは Lane = Cruise3D(3D疎グラフ), Terminal = Local3D(精密)
+        // DebugView互換
         // -----------------------
         public enum AIMode { Lane, Terminal }
+        AIMode mode = AIMode.Lane;
         public AIMode CurrentMode => mode;
 
         public Vector3 DebugTarget { get; private set; }
@@ -132,7 +95,6 @@ namespace HighOrbitAI
         public float DebugCeilingY { get; private set; }
         public bool DebugInKeepOut { get; private set; }
 
-        // DebugView互換（戦闘なしの固定）
         public bool DebugMelee { get; private set; }
         public bool DebugShooting { get; private set; }
         public bool DebugBoost { get; private set; }
@@ -141,48 +103,81 @@ namespace HighOrbitAI
         public string DebugTactic { get; private set; }
         public TacticalDirector.AltitudeBand DebugBand { get; private set; }
 
-        public int DebugWaypointIndex => waypointIndex;
-        public int DebugWaypointCount => cachedWaypoints.Count;
+        void SetDebugCombatDefaults()
+        {
+            DebugMelee = false;
+            DebugShooting = false;
+            DebugBoost = false;
+            DebugEvade = false;
+
+            DebugPhase = (mode == AIMode.Terminal) ? "Terminal" : "Cruise";
+            DebugTactic = "-";
+            DebugBand = TacticalDirector.AltitudeBand.Mid;
+        }
 
         // -----------------------
-        // Internals
+        // internal
         // -----------------------
-        AIMode mode = AIMode.Lane;
-        AIMode lastMode = AIMode.Lane;
-
-        readonly List<Transform> cachedWaypoints = new List<Transform>(128);
-        int waypointIndex = 0;
-        float lastGoalSwitchTime = -999f;
-
-        float decisionTimer;
-        float planTimer;
+        int waypointIndex;
+        float goalSwitchCooldown;
 
         Vector3 currentTarget;
         Vector3 currentGoal;
         Vector3 lastPlannedGoal;
 
-        // 共有ガード（動的更新を1フレーム1回）
-        static int s_lastDynTickFrame = -1;
-        static VolumeCollector s_lastDynTickCollector = null;
+        float decisionTimer;
+        float planTimer;
 
-        // setPath微小更新抑制
-        readonly List<Vector3> lastSentPath = new List<Vector3>(256);
-
-        // プランずらし
-        float heavyPhaseOffset;
-
-        // --- 3D cruise graph ---
-        AirLaneGraph cruiseGraph;
+        // planner
         AirLaneGraph3DBuilder cruiseBuilder;
         AStarAirLane cruiseAstar;
-        bool cruiseGraphReady;
-        Bounds cachedWorldBounds;
-        int lastDbRevision;
-
-        // --- terminal refine ---
         LocalGridPlannerVariety localPlanner;
+
+        // paths
         readonly List<Vector3> cruisePath = new List<Vector3>(512);
         readonly List<Vector3> localPath = new List<Vector3>(256);
+        readonly List<Vector3> lastSentPath = new List<Vector3>(128);
+
+        // dynamic tick global 1x per frame
+        static int s_lastDynTickFrame = -1;
+        static VolumeCollector s_lastDynTickCollector;
+
+        // ★重いプランを「全AI同時」に走らせない（フリーズ対策）
+        static int s_lastHeavyPlanFrame = -1;
+
+        // ★Cruiseグラフは collectorごとに共有＆段階生成
+        class CruiseSharedState
+        {
+            public int staticRev;
+            public int paramHash;
+            public Bounds bounds;
+            public AirLaneGraph graph;
+            public bool building;
+        }
+
+        static readonly Dictionary<int, CruiseSharedState> s_cruiseByCollector = new Dictionary<int, CruiseSharedState>(16);
+
+        // ★巡航高度（立体移動用）
+        float currentCruiseY;
+        float targetCruiseY;
+        float nextCruiseYChangeTime;
+
+        int ComputeCruiseParamHash()
+        {
+            unchecked
+            {
+                int h = 17;
+                h = h * 31 + cruiseNodeSpacingXZ.GetHashCode();
+                h = h * 31 + cruiseLayerSpacingY.GetHashCode();
+                h = h * 31 + cruiseMinY.GetHashCode();
+                h = h * 31 + cruiseMaxY.GetHashCode();
+                h = h * 31 + cruiseEdgeMaxDistance.GetHashCode();
+                h = h * 31 + cruiseSoftSamples.GetHashCode();
+                h = h * 31 + cruiseLowAltPenalty.GetHashCode();
+                h = h * 31 + cruisePenaltyBaseY.GetHashCode();
+                return h;
+            }
+        }
 
         void Reset()
         {
@@ -193,42 +188,28 @@ namespace HighOrbitAI
         {
             if (controller == null) controller = GetComponent<FlightController>();
 
-            cruiseBuilder = new AirLaneGraph3DBuilder
-            {
-                nodeSpacingXZ = cruiseNodeSpacingXZ,
-                layerSpacingY = cruiseLayerSpacingY,
-                minY = cruiseMinY,
-                maxY = cruiseMaxY,
-                edgeMaxDistance = cruiseEdgeMaxDistance,
-                softCostSamples = cruiseSoftSamples,
-                lowAltitudePenalty = cruiseLowAltPenalty,
-                penaltyBaseY = cruisePenaltyBaseY
-            };
-
+            cruiseBuilder = new AirLaneGraph3DBuilder();
             cruiseAstar = new AStarAirLane();
 
             localPlanner = new LocalGridPlannerVariety
             {
                 cellSize = localCellSize,
                 localRadius = localRadius,
+                maxNodes = 12000,
                 tieEpsilon = tieEpsilon
             };
 
             BuildWaypointCache();
             EnsureInitialTarget();
 
-            lastDbRevision = (volumeCollector != null && volumeCollector.database != null) ? volumeCollector.database.revision : 0;
-
-            DebugPhase = "None";
-            DebugTactic = "-";
-            DebugBand = TacticalDirector.AltitudeBand.Mid;
-
-            int id = GetInstanceID();
-            float r01 = Mathf.Abs((id * 1103515245 + 12345) & 0x7fffffff) / (float)int.MaxValue;
-            heavyPhaseOffset = r01;
-
             DebugLastPlanOk = false;
             DebugLastPlanMessage = "Init";
+            SetDebugCombatDefaults();
+
+            // 初期巡航高度
+            currentCruiseY = Mathf.Clamp(transform.position.y, cruiseMinY, cruiseMaxY);
+            targetCruiseY = currentCruiseY;
+            nextCruiseYChangeTime = Time.time + 0.5f;
         }
 
         void Update()
@@ -236,7 +217,7 @@ namespace HighOrbitAI
             if (volumeCollector == null || volumeCollector.database == null || controller == null)
                 return;
 
-            // Dynamic update: 1x per frame
+            // 動的更新を1フレーム1回だけ
             if (s_lastDynTickFrame != Time.frameCount || s_lastDynTickCollector != volumeCollector)
             {
                 s_lastDynTickFrame = Time.frameCount;
@@ -244,103 +225,112 @@ namespace HighOrbitAI
                 volumeCollector.TickDynamic(Time.deltaTime);
             }
 
-            int revNow = volumeCollector.database.revision;
-            if (revNow != lastDbRevision)
-            {
-                lastDbRevision = revNow;
-                planTimer = 999f;
-                cruiseGraphReady = false;
-            }
-
-            // Think (light)
+            // Think
             decisionTimer += Time.deltaTime;
             if (decisionTimer >= 1f / Mathf.Max(1f, decisionHz))
             {
                 decisionTimer = 0f;
 
-                EnsureCruiseGraph();
+                EnsureCruiseGraphShared();
+
                 MaybeAdvanceTarget();
 
-                currentGoal = BuildGoalFromTarget(currentTarget);
+                // mode判定（XZ距離）
+                float flatDist = Vector2.Distance(
+                    new Vector2(transform.position.x, transform.position.z),
+                    new Vector2(currentTarget.x, currentTarget.z)
+                );
+                DebugFlatDistance = flatDist;
+                mode = (flatDist <= terminalRange) ? AIMode.Terminal : AIMode.Lane;
+
+                // ★ここが「立体移動」の要：ゴールYをモードで切り替える
+                currentGoal = BuildGoalFromTarget(currentTarget, mode);
 
                 DebugTarget = currentTarget;
                 DebugGoal = currentGoal;
 
-                // DebugView互換（戦闘無し）
-                DebugMelee = DebugShooting = DebugBoost = DebugEvade = false;
-                DebugPhase = "None";
-                DebugTactic = "-";
-                DebugBand = TacticalDirector.AltitudeBand.Mid;
+                volumeCollector.database.EvaluatePoint(transform.position, 0.2f, out var fHere, out _);
+                DebugInKeepOut = (fHere & NavFlags.KeepOut) != 0;
 
-                // KeepOut内か（ゴール地点を軽く判定）
-                volumeCollector.database.EvaluatePoint(currentGoal, 0.8f, out var flags, out _);
-                DebugInKeepOut = (flags & NavFlags.KeepOut) != 0;
-
-                // mode判定：terminalRange以内ならTerminal(=Local3D)、それ以外はLane(=Cruise3D)
-                DebugFlatDistance = Vector2.Distance(
-                    new Vector2(transform.position.x, transform.position.z),
-                    new Vector2(currentGoal.x, currentGoal.z)
-                );
-
-                mode = (DebugFlatDistance <= terminalRange) ? AIMode.Terminal : AIMode.Lane;
-
-                if (logModeChange && mode != lastMode)
-                {
-                    Log(LogLevel.Info, $"ModeChange: {lastMode} -> {mode} (flat={DebugFlatDistance:0.0})");
-                    lastMode = mode;
-                }
+                SetDebugCombatDefaults();
             }
 
-            // Plan (heavy)
-            float planInterval = (planHz <= 0f) ? 0f : (1f / Mathf.Max(0.1f, planHz));
+            // Plan (heavy) - 全AI同時実行を抑制
             planTimer += Time.deltaTime;
+            float interval = 1f / Mathf.Max(0.25f, planHz);
 
-            bool goalMoved = (Vector2.Distance(
+            bool goalMoved = Vector2.Distance(
                 new Vector2(currentGoal.x, currentGoal.z),
                 new Vector2(lastPlannedGoal.x, lastPlannedGoal.z)
-            ) >= Mathf.Max(0.01f, replanGoalDeltaXZ));
+            ) >= replanGoalDeltaXZ;
 
-            bool timeToPlan = (planHz <= 0f) || (planTimer >= planInterval);
+            bool timeToPlan = planTimer >= interval;
 
-            bool phaseOk = true;
-            if (staggerHeavyWork && planInterval > 0f)
+            if ((timeToPlan || goalMoved) && s_lastHeavyPlanFrame != Time.frameCount)
             {
-                float phase = (Time.time / planInterval) % 1f;
-                float distPhase = Mathf.Abs(phase - heavyPhaseOffset);
-                distPhase = Mathf.Min(distPhase, 1f - distPhase);
-                phaseOk = distPhase < 0.18f;
-            }
-
-            if ((timeToPlan && phaseOk) || goalMoved)
-            {
+                s_lastHeavyPlanFrame = Time.frameCount;
                 planTimer = 0f;
-                Plan3D(currentGoal);
+
+                RunPlanner();
                 lastPlannedGoal = currentGoal;
+
+                SetDebugCombatDefaults();
             }
 
             controller.Tick(Time.deltaTime);
         }
 
-        Vector3 BuildGoalFromTarget(Vector3 target)
+        void RunPlanner()
         {
-            float groundY;
-            bool hasGround = GroundSampler.TryGetGroundY(target, groundCastHeight, groundMaxDistance, groundMask, out groundY);
-            if (!hasGround) groundY = target.y;
+            var cruiseGraph = GetSharedCruiseGraph();
 
-            float desiredY = Mathf.Clamp(groundY + lowHeight, groundY + minAboveGround, groundY + ceilingAboveGround);
-            float ceilingY = groundY + ceilingAboveGround;
-            DebugDesiredY = desiredY;
-            DebugCeilingY = ceilingY;
+            // Cruise未準備(生成中)なら直線で止めない
+            if (mode == AIMode.Lane)
+            {
+                if (cruiseGraph == null)
+                {
+                    SendPathIfChanged(new List<Vector3> { transform.position, currentGoal });
+                    DebugLastPlanOk = false;
+                    DebugLastPlanMessage = "Cruise building -> direct";
+                    return;
+                }
 
-            return new Vector3(target.x, desiredY, target.z);
+                PlanCruise(cruiseGraph, currentGoal);
+                return;
+            }
+
+            PlanTerminal(currentGoal, fallbackCruiseGraph: cruiseGraph);
         }
 
-        void EnsureCruiseGraph()
+        AirLaneGraph GetSharedCruiseGraph()
         {
-            if (cruiseGraphReady && cruiseGraph != null && cruiseGraph.nodes.Count > 0) return;
+            int cid = volumeCollector.GetInstanceID();
+            if (!s_cruiseByCollector.TryGetValue(cid, out var st)) return null;
+            return st.graph;
+        }
 
-            cachedWorldBounds = EstimateWorldBounds();
-            cachedWorldBounds.Expand(new Vector3(1400f, 0f, 1400f));
+        void EnsureCruiseGraphShared()
+        {
+            int cid = volumeCollector.GetInstanceID();
+            int staticRev = volumeCollector.database.staticRevision;
+            int ph = ComputeCruiseParamHash();
+
+            if (!s_cruiseByCollector.TryGetValue(cid, out var st))
+            {
+                st = new CruiseSharedState();
+                s_cruiseByCollector[cid] = st;
+            }
+
+            if (st.graph != null && st.staticRev == staticRev && st.paramHash == ph)
+                return;
+
+            if (st.building)
+                return;
+
+            st.building = true;
+            st.staticRev = staticRev;
+            st.paramHash = ph;
+            st.bounds = volumeCollector.GetWorldBoundsForCruise();
 
             cruiseBuilder.nodeSpacingXZ = cruiseNodeSpacingXZ;
             cruiseBuilder.layerSpacingY = cruiseLayerSpacingY;
@@ -351,118 +341,87 @@ namespace HighOrbitAI
             cruiseBuilder.lowAltitudePenalty = cruiseLowAltPenalty;
             cruiseBuilder.penaltyBaseY = cruisePenaltyBaseY;
 
-            cruiseGraph = cruiseBuilder.Build(cachedWorldBounds, volumeCollector.database, 0.7f);
-            cruiseGraphReady = cruiseGraph != null && cruiseGraph.nodes.Count > 0;
+            StartCoroutine(BuildCruiseCoroutine(st));
         }
 
-        Bounds EstimateWorldBounds()
+        IEnumerator BuildCruiseCoroutine(CruiseSharedState st)
         {
-            var cols = FindObjectsByType<Collider>(FindObjectsSortMode.None);
-            bool init = false;
-            Bounds b = new Bounds(transform.position, Vector3.one * 200f);
-            foreach (var c in cols)
-            {
-                if (!c.enabled) continue;
-                if (!init) { b = c.bounds; init = true; }
-                else b.Encapsulate(c.bounds);
-            }
-            if (!init) b = new Bounds(transform.position, Vector3.one * 600f);
-            return b;
+            AirLaneGraph built = null;
+
+            yield return cruiseBuilder.BuildIncremental(
+                st.bounds,
+                volumeCollector.database,
+                0.7f,
+                g => built = g,
+                msBudget: Mathf.Clamp(cruiseBuildBudgetMs, 0.5f, 6f)
+            );
+
+            st.graph = built;
+            st.building = false;
         }
 
-        int FindNearestCruiseNode(Vector3 p)
+        void PlanCruise(AirLaneGraph graph, Vector3 goal)
         {
-            if (cruiseGraph == null || cruiseGraph.nodes.Count == 0) return -1;
+            int s = FindNearestNode(graph, transform.position);
+            int g = FindNearestNode(graph, goal);
 
-            int best = 0;
-            float bestD = float.PositiveInfinity;
-
-            for (int i = 0; i < cruiseGraph.nodes.Count; i++)
-            {
-                Vector3 np = cruiseGraph.nodes[i].pos;
-                float dx = np.x - p.x;
-                float dy = np.y - p.y;
-                float dz = np.z - p.z;
-                float d = dx * dx + dy * dy + dz * dz;
-                if (d < bestD) { best = i; bestD = d; }
-            }
-            return best;
-        }
-
-        void Plan3D(Vector3 goal)
-        {
-            if (!cruiseGraphReady || cruiseGraph == null || cruiseGraph.nodes.Count == 0)
-            {
-                var direct = new List<Vector3> { transform.position, goal };
-                SendPathIfChanged(direct);
-                DebugLastPlanOk = false;
-                DebugLastPlanMessage = "Cruise3DGraph not ready -> direct";
-                return;
-            }
-
-            if (mode == AIMode.Terminal)
-            {
-                PlanTerminalLocal3D(goal);
-                return;
-            }
-
-            int s = FindNearestCruiseNode(transform.position);
-            int g = FindNearestCruiseNode(goal);
             if (s < 0 || g < 0)
             {
-                var direct = new List<Vector3> { transform.position, goal };
-                SendPathIfChanged(direct);
+                SendPathIfChanged(new List<Vector3> { transform.position, goal });
                 DebugLastPlanOk = false;
-                DebugLastPlanMessage = "Nearest node missing -> direct";
+                DebugLastPlanMessage = "Cruise nearest missing -> direct";
                 return;
             }
 
-            bool ok = cruiseAstar.FindPath(cruiseGraph, s, g, cruisePath);
+            cruisePath.Clear();
+            bool ok = cruiseAstar.FindPath(graph, s, g, cruisePath);
+
             DebugLastPlanOk = ok;
+            DebugLastPlanMessage = ok ? "Cruise OK" : "Cruise FAIL";
 
-            if (ok)
+            if (!ok)
             {
-                var path = new List<Vector3>(cruisePath.Count + 2);
-                path.Add(transform.position);
-                path.AddRange(cruisePath);
-                path.Add(goal);
+                SendPathIfChanged(new List<Vector3> { transform.position, goal });
+                return;
+            }
 
-                SendPathIfChanged(path);
-                DebugLastPlanMessage = $"Cruise3D ok nodes={cruisePath.Count}";
-            }
-            else
-            {
-                var direct = new List<Vector3> { transform.position, goal };
-                SendPathIfChanged(direct);
-                DebugLastPlanMessage = "Cruise3D failed -> direct";
-            }
+            var path = new List<Vector3>(cruisePath.Count + 2);
+            path.Add(transform.position);
+            path.AddRange(cruisePath);
+            path.Add(goal);
+            SendPathIfChanged(path);
         }
 
-        int ComputeVarietySeed()
+        void PlanTerminal(Vector3 goal, AirLaneGraph fallbackCruiseGraph)
         {
-            int t = Mathf.FloorToInt(Time.time / Mathf.Max(0.25f, varietyPeriod));
-            int b = transform.GetInstanceID();
-            unchecked { return b * 19349663 ^ t * 83492791; }
-        }
+            float desiredY = goal.y;
+            float ceilingY = goal.y;
 
-        void PlanTerminalLocal3D(Vector3 goal)
-        {
+            if (GroundSampler.TryGetGroundY(transform.position, groundCastHeight, groundMaxDistance, groundMask, out float groundY))
+            {
+                desiredY = Mathf.Clamp(goal.y, groundY + minAboveGround, groundY + ceilingAboveGround);
+                ceilingY = groundY + ceilingAboveGround;
+            }
+            DebugDesiredY = desiredY;
+            DebugCeilingY = ceilingY;
+
             localPlanner.cellSize = localCellSize;
             localPlanner.localRadius = localRadius;
             localPlanner.tieEpsilon = tieEpsilon;
 
             int seed = ComputeVarietySeed();
+            float agentRadius = Mathf.Max(0.01f, volumeCollector.agentRadius);
 
+            localPath.Clear();
             bool ok = localPlanner.FindPath(
                 transform.position, goal,
                 volumeCollector.database,
-                agentRadius: 0.9f,
-                maxClimbRate: controller.cruise.maxClimbRate,
-                maxSpeed: controller.cruise.maxSpeed,
-                desiredY: DebugDesiredY,
-                ceilingY: DebugCeilingY,
-                seed: seed,
-                outPath: localPath
+                agentRadius,
+                controller.maxClimbRate,
+                controller.maxSpeed,
+                desiredY, ceilingY,
+                seed,
+                localPath
             );
 
             DebugLastPlanOk = ok;
@@ -473,38 +432,142 @@ namespace HighOrbitAI
                 path.Add(transform.position);
                 path.AddRange(localPath);
                 SendPathIfChanged(path);
-                DebugLastPlanMessage = $"Terminal3D ok nodes={localPath.Count}";
+                DebugLastPlanMessage = "Terminal OK";
+                return;
+            }
+
+            if (fallbackCruiseGraph != null)
+            {
+                PlanCruise(fallbackCruiseGraph, goal);
+                DebugLastPlanMessage = "Terminal FAIL -> Cruise";
             }
             else
             {
-                var direct = new List<Vector3> { transform.position, goal };
-                SendPathIfChanged(direct);
-                DebugLastPlanMessage = "Terminal3D failed -> direct";
+                SendPathIfChanged(new List<Vector3> { transform.position, goal });
+                DebugLastPlanMessage = "Terminal FAIL -> direct";
             }
         }
 
-        void SendPathIfChanged(List<Vector3> path)
+        static int FindNearestNode(AirLaneGraph graph, Vector3 p)
         {
-            if (path == null || path.Count == 0) return;
-            if (!PathChangedSignificantly(path)) return;
+            if (graph == null || graph.nodes == null || graph.nodes.Count == 0) return -1;
 
-            controller.SetPath(path);
+            int best = 0;
+            float bestD = float.PositiveInfinity;
+
+            for (int i = 0; i < graph.nodes.Count; i++)
+            {
+                Vector3 np = graph.nodes[i].pos;
+                float dx = np.x - p.x;
+                float dy = np.y - p.y;
+                float dz = np.z - p.z;
+                float d = dx * dx + dy * dy + dz * dz;
+                if (d < bestD) { best = i; bestD = d; }
+            }
+            return best;
+        }
+
+        int ComputeVarietySeed()
+        {
+            int t = Mathf.FloorToInt(Time.time / Mathf.Max(0.25f, varietyPeriod));
+            int b = transform.GetInstanceID();
+            unchecked { return b * 19349663 ^ t * 83492791; }
+        }
+
+        // ★Lane(Cruise)用：巡航高度を自動選択（WaypointsのYが0でも立体移動になる）
+        float ComputeCruiseAltitude(Vector3 targetXZ)
+        {
+            // たまにターゲット巡航高度を更新（上下の動きを作る）
+            if (Time.time >= nextCruiseYChangeTime)
+            {
+                nextCruiseYChangeTime = Time.time + Mathf.Max(0.8f, cruiseAltitudeChangePeriod);
+
+                // 安定した乱数（個体差＋時間）
+                int id = GetInstanceID();
+                float t = Mathf.Floor(Time.time / Mathf.Max(0.5f, cruiseAltitudeChangePeriod));
+                float n = Mathf.Abs(Mathf.Sin((id * 0.00017f + 1.23f) * 10000f + t * 2.11f));
+                n = Mathf.Lerp(0.5f, n, cruiseAltitudeVariety);
+
+                float y = Mathf.Lerp(cruiseMinY, cruiseMaxY, n);
+
+                // 地面より下に行かない
+                if (GroundSampler.TryGetGroundY(new Vector3(targetXZ.x, transform.position.y, targetXZ.z),
+                        groundCastHeight, groundMaxDistance, groundMask, out float gy))
+                {
+                    y = Mathf.Max(y, gy + minAboveGround + 2f);
+                }
+
+                targetCruiseY = Mathf.Clamp(y, cruiseMinY, cruiseMaxY);
+            }
+
+            // 追従を滑らかに
+            currentCruiseY = Mathf.Lerp(currentCruiseY, targetCruiseY,
+                Mathf.Clamp01(cruiseAltitudeResponsiveness * Time.deltaTime * 10f));
+
+            return currentCruiseY;
+        }
+
+        // ★モードに応じてゴールYを決める
+        Vector3 BuildGoalFromTarget(Vector3 target, AIMode m)
+        {
+            // XZはターゲットに合わせる
+            float x = target.x;
+            float z = target.z;
+
+            if (m == AIMode.Lane)
+            {
+                // WaypointのYが0でも巡航高度で立体移動
+                float y = ComputeCruiseAltitude(new Vector3(x, 0f, z));
+                DebugDesiredY = y;
+                DebugCeilingY = y;
+                return new Vector3(x, y, z);
+            }
+
+            // Terminal: 地面＋天井内に収める
+            float yT = target.y;
+
+            if (GroundSampler.TryGetGroundY(transform.position, groundCastHeight, groundMaxDistance, groundMask, out float groundY))
+            {
+                float minY = groundY + minAboveGround;
+                float maxY = groundY + ceilingAboveGround;
+
+                // waypointがy=0なら低高度固定になりがちなので、少しだけ余裕を持たせる
+                float desired = (Mathf.Abs(yT) < 0.01f) ? (groundY + lowHeight) : yT;
+                yT = Mathf.Clamp(desired, minY, maxY);
+
+                DebugDesiredY = yT;
+                DebugCeilingY = maxY;
+            }
+            else
+            {
+                yT = Mathf.Clamp(yT, cruiseMinY, cruiseMaxY);
+                DebugDesiredY = yT;
+                DebugCeilingY = yT;
+            }
+
+            return new Vector3(x, yT, z);
+        }
+
+        void SendPathIfChanged(List<Vector3> newPath)
+        {
+            if (newPath == null || newPath.Count == 0) return;
+
+            if (lastSentPath.Count == newPath.Count)
+            {
+                float e2 = 1.5f * 1.5f;
+                bool same = true;
+                for (int i = 0; i < newPath.Count; i++)
+                {
+                    Vector3 d = newPath[i] - lastSentPath[i];
+                    if (d.sqrMagnitude > e2) { same = false; break; }
+                }
+                if (same) return;
+            }
+
+            controller.SetPath(newPath);
 
             lastSentPath.Clear();
-            for (int i = 0; i < path.Count; i++) lastSentPath.Add(path[i]);
-        }
-
-        bool PathChangedSignificantly(List<Vector3> newPath)
-        {
-            if (lastSentPath.Count == 0) return true;
-            int n = Mathf.Min(3, Mathf.Min(newPath.Count, lastSentPath.Count));
-
-            for (int i = 0; i < n; i++)
-            {
-                float d = Vector3.Distance(newPath[i], lastSentPath[i]);
-                if (d > pathChangeEpsilon) return true;
-            }
-            return false;
+            lastSentPath.AddRange(newPath);
         }
 
         // -----------------------
@@ -512,123 +575,108 @@ namespace HighOrbitAI
         // -----------------------
         void BuildWaypointCache()
         {
-            cachedWaypoints.Clear();
-
-            if (waypoints != null && waypoints.Length > 0)
-                for (int i = 0; i < waypoints.Length; i++)
-                    if (waypoints[i] != null) cachedWaypoints.Add(waypoints[i]);
-
-            if (cachedWaypoints.Count == 0 && waypointRoot != null)
+            if (waypointRoot != null)
+            {
+                var list = new List<Transform>();
                 for (int i = 0; i < waypointRoot.childCount; i++)
-                    cachedWaypoints.Add(waypointRoot.GetChild(i));
+                    list.Add(waypointRoot.GetChild(i));
+                waypoints = list.ToArray();
+            }
 
-            if (shuffleWaypoints && cachedWaypoints.Count > 1)
-                Shuffle(cachedWaypoints);
+            if (waypoints == null) waypoints = new Transform[0];
 
-            if (cachedWaypoints.Count == 0 && routeMode == RouteMode.Waypoints)
-                routeMode = RouteMode.RandomRoam;
+            if (shuffleWaypoints && waypoints.Length > 1)
+            {
+                for (int i = 0; i < waypoints.Length; i++)
+                {
+                    int j = Random.Range(i, waypoints.Length);
+                    var tmp = waypoints[i];
+                    waypoints[i] = waypoints[j];
+                    waypoints[j] = tmp;
+                }
+            }
 
-            if (autoEstimateRoamBoundsFromColliders)
-                roamBounds = EstimateRoamBoundsFallback(roamBounds);
+            waypointIndex = 0;
         }
 
         void EnsureInitialTarget()
         {
-            if (routeMode == RouteMode.Waypoints && cachedWaypoints.Count > 0)
+            if (routeMode == RouteMode.Waypoints)
             {
-                waypointIndex = Mathf.Clamp(waypointIndex, 0, cachedWaypoints.Count - 1);
-                currentTarget = cachedWaypoints[waypointIndex].position;
-                lastGoalSwitchTime = Time.time;
-                return;
+                if (waypoints != null && waypoints.Length > 0 && waypoints[0] != null)
+                    currentTarget = waypoints[0].position;
+                else
+                    currentTarget = transform.position + transform.forward * 200f;
             }
-
-            currentTarget = PickRoamTarget(transform.position);
-            lastGoalSwitchTime = Time.time;
+            else
+            {
+                currentTarget = PickRoamTarget(transform.position);
+            }
         }
 
         void MaybeAdvanceTarget()
         {
-            Vector2 a = new Vector2(transform.position.x, transform.position.z);
-            Vector2 b = new Vector2(currentTarget.x, currentTarget.z);
-            float dist = Vector2.Distance(a, b);
+            goalSwitchCooldown -= 1f / Mathf.Max(1f, decisionHz);
+            if (goalSwitchCooldown > 0f) return;
 
-            bool close = dist <= waypointReachDistXZ;
-            bool timeOk = (Time.time - lastGoalSwitchTime) >= minSecondsBetweenGoalSwitch;
+            Vector3 pos = transform.position;
 
-            if (!close || !timeOk)
+            if (routeMode == RouteMode.Waypoints)
             {
-                if (routeMode == RouteMode.Waypoints && cachedWaypoints.Count > 0)
+                if (waypoints == null || waypoints.Length == 0) return;
+
+                var wp = waypoints[waypointIndex];
+                if (wp == null) return;
+
+                float distXZ = Vector2.Distance(new Vector2(wp.position.x, wp.position.z), new Vector2(pos.x, pos.z));
+
+                if (distXZ <= waypointReachDistXZ)
                 {
-                    var t = cachedWaypoints[Mathf.Clamp(waypointIndex, 0, cachedWaypoints.Count - 1)];
-                    if (t != null) currentTarget = t.position;
+                    int next = waypointIndex + 1;
+                    if (next >= waypoints.Length)
+                    {
+                        if (!loopWaypoints) return;
+                        next = 0;
+                    }
+
+                    waypointIndex = next;
+                    var nextWp = waypoints[waypointIndex];
+                    if (nextWp != null)
+                    {
+                        currentTarget = nextWp.position;
+                        goalSwitchCooldown = minSecondsBetweenGoalSwitch;
+                    }
                 }
-                return;
             }
-
-            if (routeMode == RouteMode.Waypoints && cachedWaypoints.Count > 0)
+            else
             {
-                waypointIndex++;
-                if (waypointIndex >= cachedWaypoints.Count)
-                    waypointIndex = loopWaypoints ? 0 : cachedWaypoints.Count - 1;
+                float distXZ = Vector2.Distance(new Vector2(currentTarget.x, currentTarget.z), new Vector2(pos.x, pos.z));
 
-                currentTarget = cachedWaypoints[waypointIndex].position;
-                lastGoalSwitchTime = Time.time;
-                return;
+                if (distXZ <= waypointReachDistXZ)
+                {
+                    currentTarget = PickRoamTarget(pos);
+                    goalSwitchCooldown = minSecondsBetweenGoalSwitch;
+                }
             }
-
-            currentTarget = PickRoamTarget(transform.position);
-            lastGoalSwitchTime = Time.time;
         }
 
         Vector3 PickRoamTarget(Vector3 from)
         {
-            for (int i = 0; i < 24; i++)
-            {
-                float rx = Random.Range(roamBounds.min.x, roamBounds.max.x);
-                float rz = Random.Range(roamBounds.min.z, roamBounds.max.z);
+            Vector3 dir = Random.insideUnitSphere;
+            dir.y = 0f;
+            dir.Normalize();
 
-                float d = Vector2.Distance(new Vector2(from.x, from.z), new Vector2(rx, rz));
-                if (d < roamMinSegment) continue;
-                if (d > roamMaxSegment) continue;
+            float seg = Random.Range(roamMinSegment, roamMaxSegment);
+            Vector3 p = from + dir * seg;
 
-                return new Vector3(rx, from.y, rz);
-            }
+            p.x = Mathf.Clamp(p.x, roamBounds.min.x, roamBounds.max.x);
+            p.z = Mathf.Clamp(p.z, roamBounds.min.z, roamBounds.max.z);
 
-            return new Vector3(
-                Random.Range(roamBounds.min.x, roamBounds.max.x),
-                from.y,
-                Random.Range(roamBounds.min.z, roamBounds.max.z)
-            );
-        }
+            // roamでも立体移動：目標Yは巡航高度へ
+            float y = ComputeCruiseAltitude(new Vector3(p.x, 0f, p.z));
+            p.y = y;
 
-        static void Shuffle<T>(List<T> list)
-        {
-            for (int i = 0; i < list.Count; i++)
-            {
-                int j = Random.Range(i, list.Count);
-                (list[i], list[j]) = (list[j], list[i]);
-            }
-        }
-
-        Bounds EstimateRoamBoundsFallback(Bounds fallback)
-        {
-            var cols = FindObjectsByType<Collider>(FindObjectsSortMode.None);
-            bool init = false;
-            Bounds b = fallback;
-
-            foreach (var c in cols)
-            {
-                if (!c.enabled) continue;
-                if (!init) { b = c.bounds; init = true; }
-                else b.Encapsulate(c.bounds);
-            }
-
-            if (!init) return fallback;
-
-            b.Expand(new Vector3(800, 0, 800));
-            b.center = new Vector3(b.center.x, fallback.center.y, b.center.z);
-            b.size = new Vector3(b.size.x, fallback.size.y, b.size.z);
-            return b;
+            return p;
         }
     }
 }
