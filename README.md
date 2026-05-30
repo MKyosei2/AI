@@ -1,3 +1,13 @@
 # AI
 
-README for project planning.
+## Plan
+
+TBD.
+
+## Usage
+
+TBD.
+
+## Notes
+
+TBD.
